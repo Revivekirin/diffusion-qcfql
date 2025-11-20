@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: diffusion-qcfql
+Version: 0.1.0
+Requires-Python: >=3.8
+Requires-Dist: torch
+Requires-Dist: torchrl
+Requires-Dist: gymnasium
+Requires-Dist: numpy
+Requires-Dist: tqdm
+Requires-Dist: wandb
+Requires-Dist: ml-collections
+Requires-Dist: imageio
+Requires-Dist: h5py
+Dynamic: requires-dist
+Dynamic: requires-python

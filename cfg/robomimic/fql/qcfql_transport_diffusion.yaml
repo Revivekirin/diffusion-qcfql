@@ -1,0 +1,133 @@
+defaults:
+  - _self_
+  - override /algorithm: qcfql  
+
+hydra:
+  run:
+    dir: ${logdir}
+
+name: robomimic_transport_qcfql_${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+logdir: ${log_dir}/robomimic-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+
+# ==== Shared paths (teacher) ====
+base_policy_path: ./dppo/log/robomimic-pretrain/transport/transport_pre_diffusion_mlp_ta8_td100_ddim-100steps_size2048/2025-04-21_08-40-08_47/checkpoint/state_3000.pt
+normalization_path: ./dppo/log/robomimic/${env_name}/normalization.npz
+dppo_path: ./dppo
+
+# ==== Algorithm switch ====
+algorithm: qcfql_diffusion  
+
+seed: 1
+device: cuda:0
+use_wandb: True
+env_name: transport
+log_dir: ./logs
+
+obs_dim: 59
+action_dim: 14
+cond_steps: 1
+act_steps: 8   # diffusion teacher의 chunk size
+load_offline_data: False
+deterministic_eval: False
+
+eval_interval: 8000
+num_evals: 200
+save_model_interval: 10000
+save_replay_buffer: False
+
+# ==== Env (동일) ====
+env:
+  n_envs: 4
+  n_eval_envs: 25
+  name: ${env_name}
+  max_episode_steps: 800
+  reset_at_iteration: False
+  save_video: False
+  best_reward_threshold_for_success: 1
+  reward_offset: 1
+  wrappers:
+    robomimic_lowdim:
+      normalization_path: ${normalization_path}
+      low_dim_keys: ['robot0_eef_pos',
+                     'robot0_eef_quat',
+                     'robot0_gripper_qpos',
+                     'robot1_eef_pos',
+                     'robot1_eef_quat',
+                     'robot1_gripper_qpos',
+                     'object']
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: True
+
+wandb:
+  project: qcfql_diffusion
+  run: ${now:%H-%M-%S}_${name}
+  group: robomimic-transport-qcfql
+  entity: sophia435256-robros        
+  mode: online
+
+# ==== Diffusion teacher (pretrained, frozen) ====
+teacher:
+  _target_: model.diffusion.diffusion_eval.DiffusionEval
+  ft_denoising_steps: 0
+  predict_epsilon: True
+  denoised_clip_value: 1.0
+  randn_clip_value: 3
+
+  network_path: ${base_policy_path}
+  network:
+    _target_: model.diffusion.mlp_diffusion.DiffusionMLP
+    time_dim: 32
+    mlp_dims: [1024, 1024, 1024]
+    residual_style: True
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    horizon_steps: ${act_steps}
+    action_dim: ${action_dim}
+
+  horizon_steps: ${act_steps}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  denoising_steps: 100
+  device: ${device}
+  use_ddim: True
+  ddim_steps: 100
+  controllable_noise: True
+  # 필요 시 eval 모드에서만 사용 (train_teacher: False 등 옵션 추가 가능)
+
+# ==== QCFQL student (PyTorch) ====
+qcfql:
+  _target_: algo.qcfql.QCFQLAgent  # 아래에서 만들 PyTorch 클래스
+  device: ${device}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  horizon_length: ${act_steps}
+  action_chunking: True
+
+  # 네트워크 구조
+  actor_hidden_dims: [512, 512, 512, 512]
+  critic_hidden_dims: [512, 512, 512, 512]
+  num_qs: 2
+  use_layer_norm: True
+  actor_layer_norm: False
+
+  # 학습 하이퍼파라미터
+  lr: 3e-4
+  weight_decay: 0.0
+  discount: 0.99
+  tau: 0.005
+  alpha: 100.0   # distill/BC 계수 (조정 필요)
+  q_agg: "mean"
+  actor_type: "distill-diffusion"  # 기존 "distill-ddpg" 대신 diffusion teacher 사용
+  flow_steps: 10                   # BC-flow pretrain도 계속 쓸지 선택 가능
+
+train:
+  tau: 0.005
+  batch_size: 256
+  train_freq: 1
+  utd: 20
+  init_rollout_steps: 20001
+  n_critics: 2
+  critic_backup_combine_type: min
+  # SAC용 ent_coef 등은 QCFQL에서는 보통 사용 안 함 (그냥 Q-maximization)
