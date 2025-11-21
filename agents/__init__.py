@@ -1,5 +1,5 @@
 # from agents.fql import ACFQLAgent
-from agents.fql_claude import ACFQLAgent
+from agents.fql import ACFQLAgent
 
 agents = dict(
     acfql=ACFQLAgent,

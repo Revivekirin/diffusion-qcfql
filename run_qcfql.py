@@ -20,7 +20,7 @@ from envs.robomimic_utils import is_robomimic_env
 from utils.datasets import Dataset 
 from evaluation import evaluate
 
-from agents.fql_claude import ACFQLAgent, get_config as get_acfql_config
+from agents.fql import ACFQLAgent, get_config as get_acfql_config
 
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
@@ -234,6 +234,7 @@ def main(_):
             i == FLAGS.offline_steps - 1
             or (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0)
         ):
+            # evaluate 함수도 PyTorch agent를 받도록 수정해야 함 (TODO).
             eval_info, _, _ = evaluate(
                 agent=agent,
                 env=eval_env,
@@ -241,7 +242,6 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
-                debug=True,
             )
             print("[DEBUG] eval info :", eval_info)
             logger.log(eval_info, "eval", step=log_step)
@@ -509,7 +509,6 @@ def main(_):
 
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
-            agent.save(FLAGS.save_dir)
             # TODO: PyTorch 버전 save_agent 구현
             # save_agent(agent, FLAGS.save_dir, log_step)
             pass

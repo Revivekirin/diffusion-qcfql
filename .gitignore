@@ -1,3 +1,5 @@
 exp/
 __pycache__/
 *.egg-info
+*.err
+*.out
