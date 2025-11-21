@@ -1,6 +1,6 @@
 # from agents.fql import ACFQLAgent
-from agents.fql import ACFQLAgent
+from agents.diffusion_qcfql import DPFQLAgent
 
 agents = dict(
-    acfql=ACFQLAgent,
+    acfql=DPFQLAgent,
 )

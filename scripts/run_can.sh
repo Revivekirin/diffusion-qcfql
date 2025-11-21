@@ -17,3 +17,14 @@ MUJOCO_GL=egl python run_qcfql.py \
  --sparse=False \
  --horizon_length=5 \
 #  --eval_interval=1
+
+
+
+# diffusion_qcfql
+MUJOCO_GL=egl python run.py \
+ --run_group=reproduce  \
+ --agent.alpha=100  \
+ --env_name=can-mh-low  \
+ --sparse=False \
+ --horizon_steps=4 \
+ --horizon_length=4

@@ -21,13 +21,15 @@ from envs.robomimic_utils import is_robomimic_env
 from utils.datasets import Dataset 
 from evaluation import evaluate
 
-from agents.fql import ACFQLAgent, get_config as get_acfql_config
+from agents.diffusion_qcfql import DPFQLAgent, get_config as get_acfql_config
 
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from tensordict import TensorDict
 
+from dppo.model.diffusion.mlp_diffusion import DiffusionMLP
+from dppo.model.diffusion.diffusion import DiffusionModel
 
 # ======================================================================
 # Flags
@@ -66,7 +68,7 @@ flags.DEFINE_string('entity', 'sophia435256-robros', 'wandb entity')
 flags.DEFINE_string('mode', 'online', 'wandb mode')
 
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
-
+flags.DEFINE_integer('horizon_steps', 4, 'action chunking length which is used when training diffusion policy')
 # ======================================================================
 # Logging helper
 # ======================================================================
@@ -105,6 +107,46 @@ def numpy_batch_to_torch(batch, device):
 
     return torch_batch
 
+# ======================================================================
+# Load Teacher model
+# ======================================================================
+#(TODO) pre_diffusion_mlp.yaml과 config 동일하게
+def build_teacher_diffusion(device="cuda:0"):
+    obs_dim = 23
+    action_dim = 7
+    horizon_steps = 4
+    cond_steps = 1
+    denoising_steps = 20       # can_pre_diffusion_mlp_ta4_td20이면 20
+    use_ddim = True
+    ddim_steps = 8
+
+    network = DiffusionMLP(
+        time_dim=16,
+        mlp_dims=[512, 512, 512],
+        residual_style=True,
+        cond_dim=obs_dim * cond_steps,
+        horizon_steps=horizon_steps,
+        action_dim=action_dim,
+    )
+
+    teacher_model = DiffusionModel(
+        network=network,
+        horizon_steps=horizon_steps,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        network_path="/home/robros/git/diffusion-qcfql/dppo/log/robomimic-pretrain/can/can_pre_diffusion_mlp_ta4_td20/2024-06-28_13-29-54/checkpoint/state_5000.pt", #(TODO) 경로 자동 설정되게
+        denoising_steps=denoising_steps,
+        device=device,
+        use_ddim=use_ddim,
+        ddim_steps=ddim_steps,
+        predict_epsilon=True,
+        denoised_clip_value=1.0,
+        final_action_clip_value=1.0,     
+    )
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad = False
+    return teacher_model
 
 # ======================================================================
 # Main
@@ -135,7 +177,7 @@ def main(_):
     # 여기서는 config_flags로 읽어온 뒤, 거기에 horizon_length만 덮어쓴다고 가정.
     # (원하면 get_acfql_config()를 직접 호출해도 무방)
     config = dict(get_acfql_config())
-    config["horizon_length"] = FLAGS.horizon_length
+    config["horizon_length"] = FLAGS.horizon_steps
 
     # --------- Env & dataset (no OGBench) ---------
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
@@ -182,13 +224,17 @@ def main(_):
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
 
+    teacher_model = build_teacher_diffusion(device=device)
+    print("[DEBUG] Teacher model loaded : ", teacher_model)
+
     # --------- Agent 생성 (PyTorch) ---------
-    agent = ACFQLAgent.create(
+    agent = DPFQLAgent.create(
         seed=FLAGS.seed,
         ex_observations=np.asarray(example_batch['observations']),
         ex_actions=np.asarray(example_batch['actions']),
         config=config,
         device=str(device),
+        teacher_model=teacher_model,
     )
     
     # --------- Logging setup ---------
