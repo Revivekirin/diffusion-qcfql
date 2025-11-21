@@ -10,297 +10,9 @@ import torch.nn.functional as F
 from torch import Tensor
 import numpy as np
 
+from utils.encoders import ImpalaEncoder
+from utils.networks import Value, ActorVectorField
 
-# ============================================================================
-# Networks Module (networks.py converted to PyTorch)
-# ============================================================================
-
-def default_init(scale=1.0):
-    """Default kernel initializer - Xavier uniform with scaling."""
-    def init_fn(tensor):
-        return nn.init.xavier_uniform_(tensor, gain=scale)
-    return init_fn
-
-
-class FourierFeatures(nn.Module):
-    """Fourier features for timestep embedding."""
-    
-    def __init__(self, output_size: int = 64, learnable: bool = False):
-        super().__init__()
-        self.output_size = output_size
-        self.learnable = learnable
-        
-        if learnable:
-            self.kernel = nn.Parameter(torch.randn(output_size // 2, 1) * 0.2)
-        
-    def forward(self, x: Tensor) -> Tensor:
-        if self.learnable:
-            f = 2 * np.pi * x @ self.kernel.T
-        else:
-            half_dim = self.output_size // 2
-            f = np.log(10000) / (half_dim - 1)
-            f = torch.exp(torch.arange(half_dim, device=x.device) * -f)
-            f = x * f
-        return torch.cat([torch.cos(f), torch.sin(f)], dim=-1)
-
-
-class MLP(nn.Module):
-    """Multi-layer perceptron."""
-    
-    def __init__(
-        self,
-        hidden_dims: Sequence[int],
-        activation: str = 'gelu',
-        activate_final: bool = False,
-        layer_norm: bool = False,
-    ):
-        super().__init__()
-        self.hidden_dims = hidden_dims
-        self.activate_final = activate_final
-        self.layer_norm = layer_norm
-        
-        if activation == 'gelu':
-            self.activation = nn.GELU()
-        elif activation == 'relu':
-            self.activation = nn.ReLU()
-        else:
-            raise ValueError(f"Unknown activation: {activation}")
-        
-        layers = []
-        for i in range(len(hidden_dims)):
-            if i == 0:
-                continue
-            layers.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
-            default_init(1.0)(layers[-1].weight)
-            
-        self.layers = nn.ModuleList(layers)
-        
-        if layer_norm:
-            self.layer_norms = nn.ModuleList([
-                nn.LayerNorm(hidden_dims[i+1]) 
-                for i in range(len(hidden_dims) - 1)
-            ])
-        
-    def forward(self, x: Tensor) -> Tensor:
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i + 1 < len(self.layers) or self.activate_final:
-                x = self.activation(x)
-                if self.layer_norm:
-                    x = self.layer_norms[i](x)
-        return x
-
-
-class Value(nn.Module):
-    """Value/critic network with ensemble support."""
-    
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: Sequence[int],
-        layer_norm: bool = True,
-        num_ensembles: int = 2,
-        encoder: Optional[nn.Module] = None,
-    ):
-        super().__init__()
-        self.num_ensembles = num_ensembles
-        self.encoder = encoder
-        
-        # Create ensemble of value networks
-        self.value_nets = nn.ModuleList([
-            MLP([input_dim] + list(hidden_dims) + [1], 
-                activate_final=False, 
-                layer_norm=layer_norm)
-            for _ in range(num_ensembles)
-        ])
-        
-    def forward(self, observations: Tensor, actions: Optional[Tensor] = None) -> Tensor:
-        """Return values or critic values.
-        
-        Args:
-            observations: Observations [batch_size, obs_dim]
-            actions: Actions [batch_size, action_dim] (optional)
-            
-        Returns:
-            values: [num_ensembles, batch_size]
-        """
-        if self.encoder is not None:
-            inputs = self.encoder(observations)
-        else:
-            inputs = observations
-            
-        if actions is not None:
-            inputs = torch.cat([inputs, actions], dim=-1)
-        
-        # Compute ensemble values
-        values = torch.stack([net(inputs).squeeze(-1) for net in self.value_nets], dim=0)
-        return values
-
-class ActorVectorField(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        hidden_dims: Sequence[int],
-        layer_norm: bool = False,
-        encoder: Optional[nn.Module] = None,
-        use_time: bool = True,
-        use_fourier_features: bool = False,
-        fourier_feature_dim: int = 64,
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.use_time = use_time
-        self.use_fourier_features = use_fourier_features and use_time
-
-        if self.use_time:
-            time_dim = fourier_feature_dim if self.use_fourier_features else 1
-        else:
-            time_dim = 0
-
-        input_dim = obs_dim + action_dim + time_dim
-        self.mlp = MLP(
-            [input_dim] + list(hidden_dims) + [action_dim],
-            activate_final=False,
-            layer_norm=layer_norm,
-        )
-
-        if self.use_fourier_features:
-            self.ff = FourierFeatures(fourier_feature_dim)
-
-    def forward(
-        self,
-        observations: Tensor,
-        actions: Tensor,
-        times: Optional[Tensor] = None,
-        is_encoded: bool = False,
-    ) -> Tensor:
-        if not is_encoded and self.encoder is not None:
-            observations = self.encoder(observations)
-
-        if self.use_time and times is not None:
-            if self.use_fourier_features:
-                times = self.ff(times)
-            inputs = torch.cat([observations, actions, times], dim=-1)
-        else:
-            inputs = torch.cat([observations, actions], dim=-1)
-
-        return self.mlp(inputs)
-
-
-# ============================================================================
-# Encoders Module (encoders.py converted to PyTorch)
-# ============================================================================
-
-class ResnetStack(nn.Module):
-    """ResNet stack module."""
-    
-    def __init__(self, num_features: int, num_blocks: int, max_pooling: bool = True):
-        super().__init__()
-        self.max_pooling = max_pooling
-        
-        self.conv_in = nn.Conv2d(3, num_features, kernel_size=3, stride=1, padding=1)
-        nn.init.xavier_uniform_(self.conv_in.weight)
-        
-        self.blocks = nn.ModuleList()
-        for _ in range(num_blocks):
-            block = nn.ModuleList([
-                nn.Conv2d(num_features, num_features, kernel_size=3, stride=1, padding=1),
-                nn.Conv2d(num_features, num_features, kernel_size=3, stride=1, padding=1),
-            ])
-            nn.init.xavier_uniform_(block[0].weight)
-            nn.init.xavier_uniform_(block[1].weight)
-            self.blocks.append(block)
-            
-    def forward(self, x: Tensor) -> Tensor:
-        conv_out = self.conv_in(x)
-        
-        if self.max_pooling:
-            conv_out = F.max_pool2d(conv_out, kernel_size=3, stride=2, padding=1)
-            
-        for block in self.blocks:
-            block_input = conv_out
-            conv_out = F.relu(conv_out)
-            conv_out = block[0](conv_out)
-            conv_out = F.relu(conv_out)
-            conv_out = block[1](conv_out)
-            conv_out = conv_out + block_input
-            
-        return conv_out
-
-
-class ImpalaEncoder(nn.Module):
-    """IMPALA encoder."""
-    
-    def __init__(
-        self,
-        width: int = 1,
-        stack_sizes: Tuple[int, ...] = (16, 32, 32),
-        num_blocks: int = 2,
-        dropout_rate: Optional[float] = None,
-        mlp_hidden_dims: Sequence[int] = (512,),
-        layer_norm: bool = False,
-    ):
-        super().__init__()
-        self.dropout_rate = dropout_rate
-        self.layer_norm_flag = layer_norm
-        
-        self.stack_blocks = nn.ModuleList([
-            ResnetStack(
-                num_features=stack_sizes[i] * width,
-                num_blocks=num_blocks,
-            )
-            for i in range(len(stack_sizes))
-        ])
-        
-        if dropout_rate is not None:
-            self.dropout = nn.Dropout(dropout_rate)
-            
-        if layer_norm:
-            self.layer_norm = nn.LayerNorm(stack_sizes[-1] * width)
-            
-        # Calculate flattened size (assuming 64x64 input after 3 stacks with stride 2)
-        # This is approximate - adjust based on actual input size
-        self.flatten_size = stack_sizes[-1] * width * 8 * 8  # For 64x64 input
-        
-        mlp_dims = [self.flatten_size] + list(mlp_hidden_dims)
-        self.mlp = MLP(mlp_dims, activate_final=True, layer_norm=layer_norm)
-        
-    def forward(self, x: Tensor, train: bool = True) -> Tensor:
-        """
-        Args:
-            x: Images [batch_size, height, width, channels] or 
-               [batch_size, channels, height, width]
-        """
-        # Handle both (H,W,C) and (C,H,W) formats
-        if x.shape[-1] == 3:  # (H,W,C) format
-            x = x.permute(0, 3, 1, 2)  # Convert to (C,H,W)
-            
-        x = x.float() / 255.0
-        
-        conv_out = x
-        for stack_block in self.stack_blocks:
-            conv_out = stack_block(conv_out)
-            if self.dropout_rate is not None:
-                conv_out = self.dropout(conv_out) if train else conv_out
-                
-        conv_out = F.relu(conv_out)
-        if self.layer_norm_flag:
-            # Apply layer norm on channel dimension
-            b, c, h, w = conv_out.shape
-            conv_out = conv_out.permute(0, 2, 3, 1).contiguous()
-            conv_out = self.layer_norm(conv_out)
-            conv_out = conv_out.permute(0, 3, 1, 2).contiguous()
-            
-        out = conv_out.flatten(1)
-        out = self.mlp(out)
-        
-        return out
-
-
-# ============================================================================
-# ACFQL Agent
-# ============================================================================
 
 class ACFQLAgent:
     """Flow Q-learning (FQL) agent with action chunking."""
@@ -432,8 +144,9 @@ class ACFQLAgent:
                 (self.config['discount'] ** self.config['horizon_length']) *
                 batch['masks'][..., -1] * next_q
             )
-            
+        
         q = self.critic(batch['observations'], actions=batch_actions)
+
         critic_loss = ((q - target_q) ** 2 * batch['valid'][..., -1]).mean()
 
         return critic_loss, {
@@ -499,8 +212,8 @@ class ACFQLAgent:
             actor_actions = torch.clamp(actor_actions, -1, 1)
 
             # lambda_q = self.config.get("lambda_q", 0.01)  # 새 하이퍼
-
-            qs = self.critic(batch['observations'], actions=actor_actions)
+            
+            qs = self.critic(batch['observations'], actions=actor_actions).detach()
             q = qs.mean(dim=0)
             # q_loss = -lambda_q * q.mean()
             q_loss = -q.mean()
@@ -527,34 +240,34 @@ class ACFQLAgent:
         batch = {k: torch.as_tensor(v, device=self.device) for k, v in batch.items()}
         
         self.optimizer.zero_grad()
-        
+
         critic_loss, critic_info = self.critic_loss(batch)
         actor_loss, actor_info = self.actor_loss(batch)
-        
+
         total_loss = critic_loss + actor_loss
         total_loss.backward()
+
+        # grad 통계는 여기서 (clip 전/후 둘 중 원하는 걸로)
+        grad_norms = []
+        for p in self.critic.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
+        for p in self.actor_bc_flow.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
+        for p in self.actor_onestep_flow.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
+
         torch.nn.utils.clip_grad_norm_(
             list(self.critic.parameters()) +
             list(self.actor_bc_flow.parameters()) +
             list(self.actor_onestep_flow.parameters()),
             max_norm=10.0,
         )
+
         self.optimizer.step()
-        
-        # Compute gradient statistics
-        grad_norms = []
-        for p in self.critic.parameters():
-            if p.grad is not None:
-                grad_norms.append(p.grad.norm().item())
-        for p in self.actor_bc_flow.parameters():
-            if p.grad is not None:
-                grad_norms.append(p.grad.norm().item())
-        for p in self.actor_onestep_flow.parameters():
-            if p.grad is not None:
-                grad_norms.append(p.grad.norm().item())
-                
-        self.optimizer.step()
-        
+
         # Update target network
         self._target_update()
         

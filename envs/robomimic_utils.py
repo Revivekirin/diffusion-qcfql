@@ -82,7 +82,7 @@ def _check_dataset_exists(env_name):
         file_name = "low_dim_v15.hdf5"
 
     download_folder = os.path.join(
-        expanduser("/home/sophia435256/workspace2/git/diffusion-qcfql/robomimic/dataset"),
+        expanduser("/home/robros/git/diffusion-qcfql/robomimic/dataset"),
         task,
         dataset_type,
         file_name,

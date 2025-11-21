@@ -219,7 +219,6 @@ def main(_):
         batch_torch = numpy_batch_to_torch(batch_np, device=device)
 
         offline_info = agent.update(batch_torch)  
-        print("[DEBUG] offline info :", offline_info)
 
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)
@@ -235,7 +234,6 @@ def main(_):
             i == FLAGS.offline_steps - 1
             or (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0)
         ):
-            # evaluate 함수도 PyTorch agent를 받도록 수정해야 함 (TODO).
             eval_info, _, _ = evaluate(
                 agent=agent,
                 env=eval_env,
@@ -243,6 +241,7 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes,
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
+                debug=True,
             )
             print("[DEBUG] eval info :", eval_info)
             logger.log(eval_info, "eval", step=log_step)
@@ -510,6 +509,7 @@ def main(_):
 
         # saving
         if FLAGS.save_interval > 0 and i % FLAGS.save_interval == 0:
+            agent.save(FLAGS.save_dir)
             # TODO: PyTorch 버전 save_agent 구현
             # save_agent(agent, FLAGS.save_dir, log_step)
             pass
