@@ -1,3 +1,7 @@
 [submodule "robomimic"]
 	path = robomimic
 	url = https://github.com/ARISE-Initiative/robomimic.git
+
+[submodule "dppo"]
+	path = dppo
+	url = https://github.com/Revivekirin/dppo.git
