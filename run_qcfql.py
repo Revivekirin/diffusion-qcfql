@@ -4,6 +4,7 @@ import json
 import random
 import time
 import tqdm
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -272,7 +273,6 @@ def main(_):
             sequence_length=H,
             discount=discount,
         )
-
         # 아래 shape는 Dataset 구현에 따라 약간 다를 수 있음
         # 보통:
         #   seq["observations"]      : [1, H, obs_dim]
@@ -289,8 +289,10 @@ def main(_):
         masks_seq = np.asarray(seq["masks"])[0]             # [H]
         next_obs_seq = np.asarray(seq["next_observations"])[0]  # [H, obs_dim]
 
-        # obs0: 첫 타임스텝 관측
-        obs0 = obs_seq[0]   # [obs_dim]
+        obs0 = np.asarray(seq["observations"][0], dtype=np.float32)  # [obs_dim]
+
+        # obs0는 이미 (19,) 이므로 여기서 shape 건드리지 않는 게 맞음
+        assert obs0.ndim == 1, f"unexpected obs0.ndim: {obs0.ndim}"
 
         # valid 마스크: 첫 terminal 이후는 0
         valid_seq = np.ones(H, dtype=np.float32)
@@ -317,34 +319,43 @@ def main(_):
     # ==================================================================
     # Online RL
     # ==================================================================
-    from collections import defaultdict
     data = defaultdict(list)
     online_init_time = time.time()
 
+    # ---- 온라인 시작 전 초기화 ----
+    H = FLAGS.horizon_length
+    action_dim = example_batch["actions"].shape[-1]
+
+    ob, _ = env.reset()          # 첫 관측
+    action_queue = []            # chunk에서 꺼내 쓸 action 큐
+    trans_window = deque(maxlen=H)  # H-step window
+
     update_info = {}
+
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
 
-        # ---------------------------------------------------------------
-        # 액션 샘플링: chunk 단위로 한 번에 뽑고 queue에 쌓기
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
+        # 액션 샘플링: queue 비면 새 chunk 뽑기
+        # -----------------------------------------------------------
         if len(action_queue) == 0:
-            # obs -> torch
-            obs_t = torch.from_numpy(np.asarray(ob)).float().to(device)
-            # obs shape [obs_dim]이면 배치 차원 추가
+            obs_t = torch.from_numpy(np.asarray(ob, dtype=np.float32)).float().to(device)
             if obs_t.dim() == 1:
-                obs_t = obs_t.unsqueeze(0)
+                obs_t = obs_t.unsqueeze(0)  # [1, obs_dim]
 
             with torch.no_grad():
-                action_chunk_t = agent.sample_actions(obs_t)
-            # [B, H*A] -> numpy
-            action_chunk = action_chunk_t.cpu().numpy().reshape(-1, action_dim)
+                action_chunk_t = agent.sample_actions(obs_t)  # [1, H*A] 또는 [1, A]
+            action_chunk = action_chunk_t.cpu().numpy().reshape(-1, action_dim)  # [H, A] or [1, A]
 
             for a in action_chunk:
                 action_queue.append(a)
 
+        # 큐에서 한 스텝 액션 꺼내기
         action = action_queue.pop(0)
 
+        # -----------------------------------------------------------
+        # env step
+        # -----------------------------------------------------------
         next_ob, int_reward, terminated, truncated, info = env.step(
             np.clip(action, -1.0 + 1e-5, 1.0 - 1e-5)
         )
@@ -380,9 +391,9 @@ def main(_):
             assert int_reward <= 0.0
             int_reward = (int_reward != 0.0) * -1.0
 
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
         # 1-step transition을 window에 쌓기
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
         trans_window.append(
             dict(
                 observations=np.asarray(ob, dtype=np.float32),
@@ -394,11 +405,13 @@ def main(_):
             )
         )
 
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
         # window 길이가 H가 되면 H-step chunk로 만들어 ReplayBuffer에 추가
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
         if len(trans_window) == H:
-            obs0 = trans_window[0]["observations"]  # [obs_dim]
+            obs0 = np.asarray(trans_window[0]["observations"], dtype=np.float32)  # [obs_dim]
+            if obs0.shape == ():  # obs_dim=1일 때 안전 보정
+                obs0 = obs0.reshape(1,)
 
             actions_seq = np.stack([t["actions"] for t in trans_window], axis=0)              # [H, act_dim]
             rewards_seq = np.stack([t["rewards"] for t in trans_window], axis=0)              # [H]
@@ -415,42 +428,32 @@ def main(_):
 
             td = TensorDict(
                 {
-                    "observations": torch.from_numpy(obs0).float(),                     # [obs_dim]
-                    "actions": torch.from_numpy(actions_seq).float(),                   # [H, act_dim]
-                    "rewards": torch.from_numpy(rewards_seq).unsqueeze(-1).float(),     # [H, 1]
-                    "terminals": torch.from_numpy(terminals_seq).unsqueeze(-1).float(), # [H, 1]
-                    "masks": torch.from_numpy(masks_seq).unsqueeze(-1).float(),         # [H, 1]
-                    "next_observations": torch.from_numpy(next_obs_seq).float(),        # [H, obs_dim]
-                    "valid": torch.from_numpy(valid_seq).float(),                       # [H]
+                    "observations": torch.from_numpy(obs0).float(),
+                    "actions": torch.from_numpy(actions_seq).float(),
+                    "rewards": torch.from_numpy(rewards_seq).unsqueeze(-1).float(),
+                    "terminals": torch.from_numpy(terminals_seq).unsqueeze(-1).float(),
+                    "masks": torch.from_numpy(masks_seq).unsqueeze(-1).float(),
+                    "next_observations": torch.from_numpy(next_obs_seq).float(),
+                    "valid": torch.from_numpy(valid_seq).float(),
                 },
                 batch_size=[],
             )
             replay_buffer.add(td)
 
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------
         # 에피소드 종료 처리
-        # ---------------------------------------------------------------
-        ob, _ = env.reset()
-        action_queue = []
-        action_dim = example_batch["actions"].shape[-1]
-
-        # 🔥 H-step 시퀀스용 transition window (에피소드 전체에 걸쳐 유지)
-        from collections import deque
-        H = FLAGS.horizon_length
-        trans_window = deque(maxlen=H)
-        
+        # -----------------------------------------------------------
         if done:
             ob, _ = env.reset()
             action_queue = []
-            trans_window.clear()   # 새 에피소드 시작이므로 window 비우기
+            trans_window.clear()
         else:
             ob = next_ob
-
 
         # ---------------------------------------------------------------
         # Online 학습
         # ---------------------------------------------------------------
-        if i >= FLAGS.start_training and replay_buffer._len >= batch_size_rb:
+        if i >= FLAGS.start_training and len(replay_buffer) >= batch_size_rb:
             batch_td = replay_buffer.sample().to(device)
             # batch_td field shapes:
             #  observations      : [B, obs_dim]
