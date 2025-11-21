@@ -163,8 +163,8 @@ class ACFQLAgent:
         masks = batch["masks"].to(self.device)
         valid = batch["valid"].to(self.device)
 
-        if obs.dim() > 2:
-            obs = obs.view(obs.shape[0], -1)
+        # if obs.dim() > 2:
+        #     obs = obs.view(obs.shape[0], -1)
 
         if next_obs.dim() > 3:
             next_obs_last = next_obs[:, -1, :].contiguous()
@@ -203,19 +203,37 @@ class ACFQLAgent:
             v_last = valid[:, -1].view(-1)     # [B]
 
         # critic forward
-        q = self.network.q_value(obs, batch_actions, target=False)
-        q_mean = q.mean(dim=0)
+        # q = self.network.q_value(obs, batch_actions, target=False)
+        # q_mean = q.mean(dim=0)
 
         target_q = r_last + (self.config["discount"] ** self.config["horizon_length"]) * m_last * next_q
-        td_error = (q_mean - target_q) ** 2
-        critic_loss = (td_error * v_last).mean()
+        # td_error = (q_mean - target_q) ** 2
+        # critic_loss = (td_error * v_last).mean()
 
+        # info = {
+        #     "critic_loss": critic_loss.detach(),
+        #     "q_mean": q_mean.mean().detach(),
+        #     "q_max": q_mean.max().detach(),
+        #     "q_min": q_mean.min().detach(),
+        # }
+        q = self.network.q_value(obs, batch_actions, target=False)  # [num_qs, B]
+        # target_q: [B], v_last: [B]
+
+        target_q_exp = target_q.unsqueeze(0)      # [1, B] → broadcast
+        v_last_exp = v_last.unsqueeze(0)          # [1, B]
+
+        td_error = (q - target_q_exp) ** 2        # [num_qs, B]
+        critic_loss = (td_error * v_last_exp).mean()
+
+        # 로깅용 통계만 q_mean 써도 됨
+        q_mean_for_log = q.mean(dim=0)
         info = {
             "critic_loss": critic_loss.detach(),
-            "q_mean": q_mean.mean().detach(),
-            "q_max": q_mean.max().detach(),
-            "q_min": q_mean.min().detach(),
+            "q_mean": q_mean_for_log.mean().detach(),
+            "q_max": q_mean_for_log.max().detach(),
+            "q_min": q_mean_for_log.min().detach(),
         }
+
         return critic_loss, info
 
     def actor_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:

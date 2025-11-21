@@ -20,7 +20,7 @@ from envs.robomimic_utils import is_robomimic_env
 from utils.datasets import Dataset 
 from evaluation import evaluate
 
-from agents.fql import ACFQLAgent, get_config as get_acfql_config
+from agents.fql_claude import ACFQLAgent, get_config as get_acfql_config
 
 from torchrl.data import TensorDictReplayBuffer
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
@@ -189,7 +189,7 @@ def main(_):
         config=config,
         device=str(device),
     )
-
+    
     # --------- Logging setup ---------
     prefixes = ["eval", "env"]
     if FLAGS.offline_steps > 0:
@@ -219,6 +219,7 @@ def main(_):
         batch_torch = numpy_batch_to_torch(batch_np, device=device)
 
         offline_info = agent.update(batch_torch)  
+        print("[DEBUG] offline info :", offline_info)
 
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)
@@ -243,6 +244,7 @@ def main(_):
                 num_video_episodes=FLAGS.video_episodes,
                 video_frame_skip=FLAGS.video_frame_skip,
             )
+            print("[DEBUG] eval info :", eval_info)
             logger.log(eval_info, "eval", step=log_step)
 
     # ==================================================================
@@ -260,14 +262,57 @@ def main(_):
         batch_size=batch_size_rb,
     )
 
-    ob, _ = env.reset()
-    action_queue = []
-    action_dim = example_batch["actions"].shape[-1]
-
-    # 🔥 H-step 시퀀스용 transition window (에피소드 전체에 걸쳐 유지)
-    from collections import deque
+    # offline dataset으로 replay buffer pre-fill
     H = FLAGS.horizon_length
-    trans_window = deque(maxlen=H)
+    max_init = min(buffer_size, train_dataset.size)  # 너무 오래 안 돌게 제한
+
+    for _ in range(max_init):
+        # (1, H, ...) 시퀀스 하나 뽑기
+        seq = train_dataset.sample_sequence(
+            batch_size=1,
+            sequence_length=H,
+            discount=discount,
+        )
+
+        # 아래 shape는 Dataset 구현에 따라 약간 다를 수 있음
+        # 보통:
+        #   seq["observations"]      : [1, H, obs_dim]
+        #   seq["actions"]           : [1, H, act_dim]
+        #   seq["rewards"]           : [1, H]
+        #   seq["terminals"]         : [1, H]
+        #   seq["masks"]             : [1, H]
+        #   seq["next_observations"] : [1, H, obs_dim]
+
+        obs_seq = np.asarray(seq["observations"])[0]        # [H, obs_dim]
+        actions_seq = np.asarray(seq["actions"])[0]         # [H, act_dim]
+        rewards_seq = np.asarray(seq["rewards"])[0]         # [H]
+        terminals_seq = np.asarray(seq["terminals"])[0]     # [H]
+        masks_seq = np.asarray(seq["masks"])[0]             # [H]
+        next_obs_seq = np.asarray(seq["next_observations"])[0]  # [H, obs_dim]
+
+        # obs0: 첫 타임스텝 관측
+        obs0 = obs_seq[0]   # [obs_dim]
+
+        # valid 마스크: 첫 terminal 이후는 0
+        valid_seq = np.ones(H, dtype=np.float32)
+        for t_idx in range(1, H):
+            if terminals_seq[t_idx - 1] > 0.5:
+                valid_seq[t_idx:] = 0.0
+                break
+
+        td = TensorDict(
+            {
+                "observations": torch.from_numpy(obs0).float(),
+                "actions": torch.from_numpy(actions_seq).float(),
+                "rewards": torch.from_numpy(rewards_seq).unsqueeze(-1).float(),
+                "terminals": torch.from_numpy(terminals_seq).unsqueeze(-1).float(),
+                "masks": torch.from_numpy(masks_seq).unsqueeze(-1).float(),
+                "next_observations": torch.from_numpy(next_obs_seq).float(),
+                "valid": torch.from_numpy(valid_seq).float(),
+            },
+            batch_size=[],
+        )
+        replay_buffer.add(td)
 
 
     # ==================================================================
@@ -278,8 +323,7 @@ def main(_):
     online_init_time = time.time()
 
     update_info = {}
-
-    for i in range(1, FLAGS.online_steps + 1):
+    for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
 
         # ---------------------------------------------------------------
@@ -387,6 +431,15 @@ def main(_):
         # ---------------------------------------------------------------
         # 에피소드 종료 처리
         # ---------------------------------------------------------------
+        ob, _ = env.reset()
+        action_queue = []
+        action_dim = example_batch["actions"].shape[-1]
+
+        # 🔥 H-step 시퀀스용 transition window (에피소드 전체에 걸쳐 유지)
+        from collections import deque
+        H = FLAGS.horizon_length
+        trans_window = deque(maxlen=H)
+        
         if done:
             ob, _ = env.reset()
             action_queue = []

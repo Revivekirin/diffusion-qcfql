@@ -1,2 +1,0 @@
-critic/critic_loss,critic/q_mean,critic/q_max,critic/q_min,actor/actor_loss,actor/bc_flow_loss,actor/distill_loss,loss,step
-tensor(3862.7119, device='cuda:0'),tensor(966.2980, device='cuda:0'),tensor(989.8971, device='cuda:0'),tensor(4.5123, device='cuda:0'),tensor(-1068.9513, device='cuda:0'),tensor(0.1088, device='cuda:0'),tensor(0.0205, device='cuda:0'),tensor(2793.7607, device='cuda:0'),5000

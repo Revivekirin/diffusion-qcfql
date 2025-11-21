@@ -7,3 +7,4 @@ wandb
 ml-collections
 imageio
 h5py
+robosuite

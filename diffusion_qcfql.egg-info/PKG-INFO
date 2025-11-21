@@ -11,5 +11,6 @@ Requires-Dist: wandb
 Requires-Dist: ml-collections
 Requires-Dist: imageio
 Requires-Dist: h5py
+Requires-Dist: robosuite
 Dynamic: requires-dist
 Dynamic: requires-python

@@ -1,4 +1,3 @@
-# robomimic_utils.py
 from os.path import expanduser
 import os
 
@@ -83,7 +82,7 @@ def _check_dataset_exists(env_name):
         file_name = "low_dim_v15.hdf5"
 
     download_folder = os.path.join(
-        expanduser("/home/robros/git/qc/robomimic/dataset"),
+        expanduser("/home/sophia435256/workspace2/git/diffusion-qcfql/robomimic/dataset"),
         task,
         dataset_type,
         file_name,
