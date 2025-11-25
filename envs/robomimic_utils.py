@@ -22,11 +22,23 @@ def is_robomimic_env(env_name):
     return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph", "mg")
 
 
+# low_dim_keys = {
+#     "low_dim": (
+#         "robot0_eef_pos",
+#         "robot0_eef_quat",
+#         "robot0_gripper_qpos",
+#         "object",
+#     )
+# }
+
 low_dim_keys = {
     "low_dim": (
         "robot0_eef_pos",
         "robot0_eef_quat",
         "robot0_gripper_qpos",
+        "robot1_eef_pos",
+        "robot1_eef_quat",
+        "robot1_gripper_qpos",
         "object",
     )
 }
