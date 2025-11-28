@@ -1,6 +1,7 @@
 # from agents.fql import ACFQLAgent
-from agents.fql_bc_rnn import ACFQLAgent
-
+from agents.fql import ACFQLAgent
+from agents.fql_ptr import ACFQLAgent_PTR
 agents = dict(
-    acfql2=ACFQLAgent
+    acfql=ACFQLAgent,
+    acfql_ptr=ACFQLAgent_PTR
 )

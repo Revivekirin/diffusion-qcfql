@@ -22,26 +22,26 @@ def is_robomimic_env(env_name):
     return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph", "mg")
 
 
-# low_dim_keys = {
-#     "low_dim": (
-#         "robot0_eef_pos",
-#         "robot0_eef_quat",
-#         "robot0_gripper_qpos",
-#         "object",
-#     )
-# }
-
 low_dim_keys = {
     "low_dim": (
         "robot0_eef_pos",
         "robot0_eef_quat",
         "robot0_gripper_qpos",
-        "robot1_eef_pos",
-        "robot1_eef_quat",
-        "robot1_gripper_qpos",
         "object",
     )
 }
+
+# low_dim_keys = {
+#     "low_dim": (
+#         "robot0_eef_pos",
+#         "robot0_eef_quat",
+#         "robot0_gripper_qpos",
+#         "robot1_eef_pos",
+#         "robot1_eef_quat",
+#         "robot1_gripper_qpos",
+#         "object",
+#     )
+# }
 ObsUtils.initialize_obs_modality_mapping_from_dict(low_dim_keys)
 
 
@@ -108,10 +108,10 @@ def get_dataset(env, env_name):
     dataset_path = _check_dataset_exists(env_name)
 
     rm_dataset = h5py.File(dataset_path, "r")
-    demos = list(rm_dataset["data"].keys())
+    demos = list(rm_dataset["data"].keys()) 
     num_demos = len(demos)
     inds = np.argsort([int(elem[5:]) for elem in demos])
-    demos = [demos[i] for i in inds]
+    demos = [demos[i] for i in inds] #['demo_0', 'demo_1',...]
 
     num_timesteps = 0
     for ep in demos:
@@ -127,9 +127,12 @@ def get_dataset(env, env_name):
     terminals = []
     rewards = []
     masks = []
+    episode_ids = []
+    episode_steps = []
+
 
     # go through and add to the data holder
-    for ep in demos:
+    for ep_idx, ep in enumerate(demos):
         a = np.array(rm_dataset[f"data/{ep}/actions"])
         obs_list, next_obs_list = [], []
         for k in low_dim_keys["low_dim"]:
@@ -142,12 +145,20 @@ def get_dataset(env, env_name):
         dones = np.array(rm_dataset[f"data/{ep}/dones"])
         r = np.array(rm_dataset[f"data/{ep}/rewards"])
 
+        T = a.shape[0]
+
         observations.append(obs.astype(np.float32))
         actions.append(a.astype(np.float32))
         rewards.append(r.astype(np.float32))
         terminals.append(dones.astype(np.float32))
         masks.append(1.0 - dones.astype(np.float32))
         next_observations.append(next_obs.astype(np.float32))
+
+        episode_ids.append(
+            np.full(shape=(T,), fill_value=ep_idx, dtype=np.int32))
+        episode_steps.append(
+            np.arange(T, dtype=np.int32)
+        )
 
     return Dataset.create(
         observations=np.concatenate(observations, axis=0),
@@ -156,6 +167,8 @@ def get_dataset(env, env_name):
         terminals=np.concatenate(terminals, axis=0),
         masks=np.concatenate(masks, axis=0),
         next_observations=np.concatenate(next_observations, axis=0),
+        episode_ids=np.concatenate(episode_ids, axis=0),
+        episode_steps=np.concatenate(episode_steps, axis=0),
     )
 
 

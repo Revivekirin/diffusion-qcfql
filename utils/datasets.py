@@ -176,6 +176,9 @@ class Dataset(dict):
         rew_all = self["rewards"]
         masks_all = self["masks"]
         terms_all = self["terminals"]
+        has_rewards_ptr = "rewards_ptr" in self
+        if has_rewards_ptr:
+            rew_ptr_all = self["rewards_ptr"]
 
         # reshape to [B, L, ...]
         batch_observations = obs_all[all_idxs].reshape(
@@ -196,6 +199,10 @@ class Dataset(dict):
         batch_terminals = terms_all[all_idxs].reshape(
             batch_size, sequence_length, *terms_all.shape[1:]
         )
+        if has_rewards_ptr:
+            batch_rewards_ptr = rew_ptr_all[all_idxs].reshape(
+                batch_size, sequence_length, *rew_ptr_all.shape[1:]
+            )
 
         # next_actions
         next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
@@ -237,8 +244,15 @@ class Dataset(dict):
         actions = batch_actions
         next_actions = batch_next_actions
 
-        return dict(
-            observations=data["observations"].copy(),  # 시작 시점 관측
+        ep_idx = np.searchsorted(self.initial_locs, all_idxs, side="right") - 1  # (B*L,)
+        ep_idx = np.clip(ep_idx, 0, len(self.initial_locs) - 1)
+
+        ep_steps_flat = all_idxs - self.initial_locs[ep_idx]   # episode 내 step
+        episode_ids = ep_idx.reshape(batch_size, sequence_length).astype(np.int32)
+        episode_steps = ep_steps_flat.reshape(batch_size, sequence_length).astype(np.int32)
+
+        ret =  dict(
+            observations=data["observations"].copy(),  
             full_observations=full_observations,
             actions=actions,
             masks=masks,
@@ -248,6 +262,14 @@ class Dataset(dict):
             next_observations=next_observations,
             next_actions=next_actions,
         )
+    
+        if has_rewards_ptr:
+            ret["rewards_ptr"] = batch_rewards_ptr
+
+        ret["episode_ids"] = episode_ids
+        ret["episode_steps"] = episode_steps
+
+        return ret
 
     # ------------------------------------------------------------------
     # Augmentation
