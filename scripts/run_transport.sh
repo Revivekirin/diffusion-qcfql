@@ -36,4 +36,5 @@ MUJOCO_GL=egl python run_qcfql_ptr_ver1.py \
  --env_name=transport-mg-low  \
  --sparse=False \
  --horizon_length=5 \
- --sparse=False
+ --sparse=False \
+ --priority_mode=episode

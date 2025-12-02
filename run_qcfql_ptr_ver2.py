@@ -29,7 +29,7 @@ from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from tensordict import TensorDict
 
-from utils.ptr_buffer import PrioritizedChunkReplayBuffer, PrioritySampler
+from utils.ptr_buffer import PrioritizedChunkReplayBuffer, PrioritySampler, build_traj_index, init_active_trajs, sample_traj_batch, compute_episode_scores
 
 
 # ======================================================================
@@ -39,6 +39,10 @@ from utils.ptr_buffer import PrioritizedChunkReplayBuffer, PrioritySampler
 FLAGS = flags.FLAGS
 EPISODE_TO_INDICES = defaultdict(list)
 TR_INTERVAL = 1000
+
+DEBUG_TR = True
+DEBUG_TR_EP = 0  
+TR_DEBUG_LOGS = []
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
@@ -76,6 +80,10 @@ flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_float('ptr_alpha', 1.0, 'PTR priority scaling factor')
 flags.DEFINE_float('ptr_eps_uniform', 0.2, 'Uniform sampling probability for PTR')
 flags.DEFINE_bool('use_shaped_for_priority', True, 'Use shaped reward for priority calculation')
+
+
+flags.DEFINE_enum('priority_mode', 'chunk', ['chunk', 'episode'],
+                  'Priority calculation mode')
 
 # Log config
 PTR_CHUNK_LOGS = []
@@ -144,96 +152,118 @@ def numpy_batch_to_torch(batch, device):
 # PTR: compute chunk-level quality (FIXED)
 # ======================================================================
 
-
 # def compute_quality(td, CURRENT_STAGE="offline_prefill"):
-#     #rewards = td["rewards"].squeeze(-1).cpu().numpy()
-#     rewards = td["rewards_ptr"].squeeze(-1).cpu().numpy()
+#     """
+#     개선된 PTR priority 계산 (음수 reward 대응):
+#     - 원본 reward(rewards_ptr) 기반으로 quality 계산
+#     - 음수 값을 양수로 변환하여 priority 할당
+#     - 상대적 순위 기반 접근
+#     """
+#     # 1) 항상 원본 reward 사용 (shaped reward는 음수가 많아 priority 계산에 부적합)
+#     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
 #     valid = td["valid"].cpu().numpy().astype(bool)
-
-#     r_valid = rewards[valid]
+#     r_valid = rewards_ptr[valid]
+    
 #     if r_valid.size == 0:
-#         return 1e-3
+#         return 1.0  # 기본값
 
-#     # 1) Return
-#     ret = float(r_valid.sum())
-
-#     # 2) Avg reward
+#     # 2) 통계량 계산
+#     traj_return = float(r_valid.sum())
 #     avg_r = float(r_valid.mean())
-
-#     # 3) UQM (상위 25% 평균)
+    
+#     # Upper quartile mean (UQM)
 #     k = max(1, int(0.25 * r_valid.size))
 #     topk = np.partition(r_valid, -k)[-k:]
 #     uqm = float(topk.mean())
-
-#     # 예: sparse 환경에서는 avg_r, uqm, min_r를 조합해서 priority
+    
 #     min_r = float(r_valid.min())
+#     max_r = float(r_valid.max())
 
-#     # 간단히: ret + λ1*avg_r + λ2*uqm + λ3*min_r 같은 형태도 가능
-#     q = ret + 0.5 * avg_r + 0.5 * uqm + 0.1 * min_r
+#     # 3) Priority 계산 전략 (Robomimic 최적화)
+#     if is_robomimic_env(FLAGS.env_name):
+#         # Strategy 1: 성공 여부 기반 (이진 분류)
+#         if traj_return > 0.5:  # 성공
+#             q = 100.0 + traj_return * 10.0  # 높은 base + 추가 보상
+#         elif traj_return > 0.0:  # 부분 성공
+#             q = 50.0 + traj_return * 10.0
+#         elif avg_r > -0.5:  # 실패했지만 괜찮은 trajectory
+#             q = 10.0 + (avg_r + 1.0) * 10.0  # -1 penalty 보정
+#         else:  # 매우 나쁜 trajectory
+#             q = 1.0 + max(0, avg_r + 1.0) * 5.0
+#     else:
+#         # 일반 환경: 논문의 공식 사용
+#         q = traj_return + 0.5 * avg_r + 0.5 * uqm
+#         # 음수를 양수로 변환 (offset 추가)
+#         if q < 0:
+#             q = np.exp(q / 10.0)  # 지수 변환으로 양수화
+#         q = max(q, 0.1)  # 최소값 보장
+    
+#     # 4) 스케일링
+#     q = q * FLAGS.ptr_alpha
+#     q = max(q, 0.01)  # 절대 최소값
 
 #     PTR_CHUNK_LOGS.append({
 #         "stage": CURRENT_STAGE,
-#         "mode": "quality_combo",
-#         "traj_return": ret,
+#         "traj_return": traj_return,
 #         "avg_r": avg_r,
 #         "uqm": uqm,
 #         "min_r": min_r,
+#         "max_r": max_r,
 #         "quality": q,
 #     })
-#     return float(max(q, 1e-6))
+
+#     return q
 
 def compute_quality(td, CURRENT_STAGE="offline_prefill"):
     """
-    개선된 PTR priority 계산 (음수 reward 대응):
-    - 원본 reward(rewards_ptr) 기반으로 quality 계산
-    - 음수 값을 양수로 변환하여 priority 할당
-    - 상대적 순위 기반 접근
+    Chunk-level priority 계산:
+    - 해당 chunk의 H-step만 보고 계산
+    - 빠르고 세밀한 우선순위
     """
-    # 1) 항상 원본 reward 사용 (shaped reward는 음수가 많아 priority 계산에 부적합)
     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
     valid = td["valid"].cpu().numpy().astype(bool)
     r_valid = rewards_ptr[valid]
     
     if r_valid.size == 0:
-        return 1.0  # 기본값
-
-    # 2) 통계량 계산
+        return 1.0
+    
+    # 통계량 계산
     traj_return = float(r_valid.sum())
     avg_r = float(r_valid.mean())
     
-    # Upper quartile mean (UQM)
     k = max(1, int(0.25 * r_valid.size))
     topk = np.partition(r_valid, -k)[-k:]
     uqm = float(topk.mean())
     
     min_r = float(r_valid.min())
     max_r = float(r_valid.max())
-
-    # 3) Priority 계산 전략 (Robomimic 최적화)
-    if is_robomimic_env(FLAGS.env_name):
-        # Strategy 1: 성공 여부 기반 (이진 분류)
-        if traj_return > 0.5:  # 성공
-            q = 100.0 + traj_return * 10.0  # 높은 base + 추가 보상
-        elif traj_return > 0.0:  # 부분 성공
-            q = 50.0 + traj_return * 10.0
-        elif avg_r > -0.5:  # 실패했지만 괜찮은 trajectory
-            q = 10.0 + (avg_r + 1.0) * 10.0  # -1 penalty 보정
-        else:  # 매우 나쁜 trajectory
-            q = 1.0 + max(0, avg_r + 1.0) * 5.0
-    else:
-        # 일반 환경: 논문의 공식 사용
-        q = traj_return + 0.5 * avg_r + 0.5 * uqm
-        # 음수를 양수로 변환 (offset 추가)
-        if q < 0:
-            q = np.exp(q / 10.0)  # 지수 변환으로 양수화
-        q = max(q, 0.1)  # 최소값 보장
     
-    # 4) 스케일링
+    # Priority 계산
+    if is_robomimic_env(FLAGS.env_name):
+        base_score = traj_return + 0.5 * avg_r + 0.5 * uqm
+        
+        if traj_return > 0.5:
+            q = 100.0 + np.clip(base_score * 10, 0, 100)
+        elif traj_return > -0.5 * r_valid.size:
+            normalized = (traj_return + 0.5 * r_valid.size) / (0.5 * r_valid.size)
+            q = 10.0 + normalized * 90.0
+        else:
+            q = 1.0 + max(0, (traj_return + r_valid.size) / r_valid.size) * 9.0
+        
+        if uqm > avg_r + 0.1:
+            q *= 1.2
+    else:
+        q = traj_return + 0.5 * avg_r + 0.5 * uqm
+        if q < 0:
+            q = np.exp(q / 10.0)
+        q = max(q, 0.1)
+    
     q = q * FLAGS.ptr_alpha
-    q = max(q, 0.01)  # 절대 최소값
-
+    q = max(q, 0.1)
+    
     PTR_CHUNK_LOGS.append({
         "stage": CURRENT_STAGE,
+        "mode": "chunk",
         "traj_return": traj_return,
         "avg_r": avg_r,
         "uqm": uqm,
@@ -241,10 +271,136 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
         "max_r": max_r,
         "quality": q,
     })
-
+    
     return q
 
+
+def compute_episode_quality(ep_id, episode_to_indices, storage):
+    """
+    Episode-level priority 계산:
+    - 전체 episode의 모든 chunk를 합쳐서 계산
+    - 논문의 정확한 구현, 더 안정적
+    """
+    idx_list = episode_to_indices.get(ep_id, [])
+    if len(idx_list) == 0:
+        return 1.0
     
+    # 전체 episode의 모든 reward 수집
+    all_rewards = []
+    for idx in idx_list:
+        td = storage[idx]
+        rewards = td["rewards_ptr"].squeeze(-1).cpu().numpy()
+        valid = td["valid"].cpu().numpy().astype(bool)
+        all_rewards.extend(rewards[valid].tolist())
+    
+    if len(all_rewards) == 0:
+        return 1.0
+    
+    r = np.array(all_rewards, dtype=np.float32)
+    
+    # 통계량 계산
+    traj_return = float(r.sum())
+    avg_r = float(r.mean())
+    
+    k = max(1, int(0.25 * len(r)))
+    uqm = float(np.partition(r, -k)[-k:].mean())
+    
+    min_r = float(r.min())
+    max_r = float(r.max())
+    
+    # Priority 계산
+    if is_robomimic_env(FLAGS.env_name):
+        base_score = traj_return + 0.5 * avg_r + 0.5 * uqm
+        
+        if traj_return > 0.5:
+            q = 100.0 + np.clip(base_score * 10, 0, 100)
+        elif traj_return > -0.5 * len(r):
+            normalized = (traj_return + 0.5 * len(r)) / (0.5 * len(r))
+            q = 10.0 + normalized * 90.0
+        else:
+            q = 1.0 + max(0, (traj_return + len(r)) / len(r)) * 9.0
+        
+        if uqm > avg_r + 0.1:
+            q *= 1.2
+    else:
+        q = traj_return + 0.5 * avg_r + 0.5 * uqm
+        if q < 0:
+            q = np.exp(q / 10.0)
+        q = max(q, 0.1)
+    
+    q = q * FLAGS.ptr_alpha
+    q = max(q, 0.1)
+    
+    PTR_CHUNK_LOGS.append({
+        "stage": "episode_init",
+        "mode": "episode",
+        "ep_id": int(ep_id),
+        "num_chunks": len(idx_list),
+        "traj_return": traj_return,
+        "avg_r": avg_r,
+        "uqm": uqm,
+        "min_r": min_r,
+        "max_r": max_r,
+        "quality": q,
+    })
+    
+    return q
+
+
+def init_priorities(episode_to_indices, storage, priorities, mode='chunk'):
+    """
+    Priority 초기화 - chunk 또는 episode mode 선택
+    
+    Args:
+        mode: 'chunk' 또는 'episode'
+    """
+    if mode == 'chunk':
+        # Chunk-level: 각 chunk 개별 계산
+        print(f"[PTR] Initializing chunk-level priorities...")
+        for idx in range(len(storage)):
+            td = storage[idx]
+            q = compute_quality(td, CURRENT_STAGE="offline_prefill")
+            priorities[idx] = q
+            
+    elif mode == 'episode':
+        # Episode-level: episode별 계산 후 모든 chunk에 동일하게 할당
+        print(f"[PTR] Initializing episode-level priorities...")
+        for ep_id, idx_list in episode_to_indices.items():
+            if len(idx_list) == 0:
+                continue
+            
+            ep_quality = compute_episode_quality(ep_id, episode_to_indices, storage)
+            
+            # 해당 episode의 모든 chunk에 동일한 priority 할당
+            for idx in idx_list:
+                priorities[idx] = ep_quality
+    
+    else:
+        raise ValueError(f"Unknown priority mode: {mode}")
+    
+    # 통계 출력
+    nonzero = priorities[priorities > 0]
+    print(f"[PTR] Priority initialization ({mode} mode) complete:")
+    print(f"  Total chunks: {len(storage)}")
+    print(f"  Non-zero priorities: {len(nonzero)}")
+    print(f"  min={nonzero.min():.2f}, max={nonzero.max():.2f}, "
+          f"mean={nonzero.mean():.2f}, median={np.median(nonzero.cpu().numpy()):.2f}")
+    
+    # 분포 시각화
+    pri_vals = priorities[:len(storage)].cpu().numpy()
+    pri_nonzero = pri_vals[pri_vals > 0]
+    print(f"\n[PTR] Priority distribution:")
+    print(f"  0-10:   {np.sum((pri_nonzero > 0) & (pri_nonzero < 10))} chunks "
+          f"({100*np.mean((pri_nonzero > 0) & (pri_nonzero < 10)):.1f}%)")
+    print(f"  10-50:  {np.sum((pri_nonzero >= 10) & (pri_nonzero < 50))} chunks "
+          f"({100*np.mean((pri_nonzero >= 10) & (pri_nonzero < 50)):.1f}%)")
+    print(f"  50-100: {np.sum((pri_nonzero >= 50) & (pri_nonzero < 100))} chunks "
+          f"({100*np.mean((pri_nonzero >= 50) & (pri_nonzero < 100)):.1f}%)")
+    print(f"  100+:   {np.sum(pri_nonzero >= 100)} chunks "
+          f"({100*np.mean(pri_nonzero >= 100):.1f}%)")
+    
+    return priorities
+
 # ======================================================================
 # PTR: Weighted Backward Update based on TR (FIXED)
 # ======================================================================
@@ -286,37 +442,28 @@ def convert_td_to_batch(td: TensorDict) -> Dict[str, torch.Tensor]:
 
     return batch
 
-
-def update_with_tr_lite(agent,
-                        replay_buffer,
-                        sampler,
-                        storage,
-                        gamma,
-                        H,
-                        logger,
+def update_with_tr_lite(agent, 
+                        replay_buffer, 
+                        sampler, 
+                        storage, 
+                        gamma, 
+                        H, 
+                        logger, 
                         log_step):
-    """
-    PTR-TR 업데이트 (개선):
-    - backward return 계산
-    - critic + priority 업데이트
-    - target network soft update 추가
-    """
-    # 1. chunk 하나 샘플
+    
     td_batch = replay_buffer.sample(1)
     ep_id = int(td_batch["episode_id"][0].item())
 
-    # 2. 해당 episode 전체 chunk 리스트
     idx_td_list = get_chunks_by_episode(ep_id, storage, EPISODE_TO_INDICES)
     if len(idx_td_list) == 0:
         return
 
-    # chunk_index 기준 정렬
     idx_td_list = sorted(
         idx_td_list,
         key=lambda pair: int(pair[1]["chunk_index"].item())
     )
 
-    # 3. Backward return 계산
+    # Backward return 계산
     G = 0.0
     returns = []
     for idx, c in reversed(idx_td_list):
@@ -334,27 +481,37 @@ def update_with_tr_lite(agent,
 
     returns.reverse()
 
-    # 4. Critic + priority 업데이트
-    all_indices = []
-    all_priorities = []
+    # Critic 업데이트 및 priority 재계산
+    if FLAGS.priority_mode == 'episode':
+        # Episode mode: 한 번만 계산하여 모든 chunk에 동일 할당
+        ep_quality = compute_episode_quality(ep_id, EPISODE_TO_INDICES, storage)
+        all_indices = [idx for idx, _ in idx_td_list]
+        all_priorities = [ep_quality] * len(all_indices)
+        
+        for (idx, chunk_td), G_k in zip(idx_td_list, returns):
+            batch = convert_td_to_batch(chunk_td)
+            ptr_critic_info = agent.update_critic(batch, G_k)
+            logger.log(ptr_critic_info, "offline_agent", step=log_step)
+    
+    else:  # chunk mode
+        # Chunk mode: 각 chunk 개별 계산
+        all_indices = []
+        all_priorities = []
+        
+        for (idx, chunk_td), G_k in zip(idx_td_list, returns):
+            batch = convert_td_to_batch(chunk_td)
+            ptr_critic_info = agent.update_critic(batch, G_k)
+            logger.log(ptr_critic_info, "offline_agent", step=log_step)
+            
+            all_indices.append(idx)
+            q_new = compute_quality(chunk_td, CURRENT_STAGE="tr_update")
+            all_priorities.append(q_new)
 
-    for (idx, chunk_td), G_k in zip(idx_td_list, returns):
-        batch = convert_td_to_batch(chunk_td)
-        ptr_critic_info = agent.update_critic(batch, G_k)
-        logger.log(ptr_critic_info, "offline_agent", step=log_step)
-
-        all_indices.append(idx)
-        # Priority는 G_k 자체가 아니라, quality 재계산
-        q_new = compute_quality(chunk_td, CURRENT_STAGE="tr_update")
-        all_priorities.append(q_new)
-
-    # Sampler에 priority 업데이트
+    # Priority 업데이트
     if len(all_indices) > 0:
         indices_tensor = torch.tensor(all_indices, dtype=torch.long)
         pri_tensor = torch.tensor(all_priorities, dtype=torch.float32)
         sampler.update_priority(indices_tensor, pri_tensor)
-
-
 
 # ======================================================================
 # Main
@@ -419,7 +576,6 @@ def main(_):
         if FLAGS.sparse:
             shaped_rewards = (shaped_rewards != 0.0) * -1.0
 
-        # 두 reward 모두 저장
         ds = ds.copy(add_or_replace={
             "rewards": shaped_rewards,
             "rewards_ptr": orig_rewards
@@ -429,7 +585,6 @@ def main(_):
 
     train_dataset = process_train_dataset(train_dataset)
     example_batch = train_dataset.sample(())
-    print("Dataset keys:", train_dataset.keys())
 
     # Agent 생성
     agent = ACFQLAgent_PTR.create(
@@ -466,6 +621,25 @@ def main(_):
     storage = LazyTensorStorage(capacity)
     batch_size_offline = config["batch_size"]
 
+    storage_episode_ids = torch.full((capacity,), -1, dtype=torch.long)
+    storage_chunk_indices = torch.full((capacity,), -1, dtype=torch.long)
+
+    def deregister_slot(slot_idx: int):
+        old_ep = int(storage_episode_ids[slot_idx].item())
+        if old_ep >= 0:
+            ep_list = EPISODE_TO_INDICES.get(old_ep, [])
+            if slot_idx in ep_list:
+                ep_list.remove(slot_idx)
+                if len(ep_list) == 0:
+                    EPISODE_TO_INDICES.pop(old_ep, None)
+        storage_episode_ids[slot_idx] = -1
+        storage_chunk_indices[slot_idx] = -1
+
+    def register_slot(slot_idx: int, ep_id: int, chunk_idx: int):
+        EPISODE_TO_INDICES[ep_id].append(slot_idx)
+        storage_episode_ids[slot_idx] = ep_id
+        storage_chunk_indices[slot_idx] = chunk_idx
+
     replay_buffer = TensorDictReplayBuffer(
         storage=storage,
         sampler=sampler,
@@ -481,18 +655,16 @@ def main(_):
     num_added = 0
     print(f"[PTR] Filling offline buffer: target={max_init_offline}")
 
-    # 데이터셋을 순회하면서 chunk 생성
     dataset_indices = np.arange(0, train_dataset.size - H, H)  
     np.random.shuffle(dataset_indices)  
     
     for start_idx in dataset_indices[:max_init_offline]:
-        # 연속된 H step chunk 생성
         end_idx = min(start_idx + H, train_dataset.size)
         actual_H = end_idx - start_idx
         
         if actual_H < H:
             continue 
-        
+
         # Dataset에서 직접 추출
         obs_seq = train_dataset["observations"][start_idx:end_idx]
         actions_seq = train_dataset["actions"][start_idx:end_idx]
@@ -502,19 +674,6 @@ def main(_):
         masks_seq = train_dataset["masks"][start_idx:end_idx]
         next_obs_seq = train_dataset["next_observations"][start_idx:end_idx]
 
-        # print("[DEBUG] Chunk data shapes:", 
-        #       start_idx, end_idx,
-        #       np.asarray(obs_seq).shape,
-        #       np.asarray(actions_seq).shape,
-        #       np.asarray(rewards_seq).shape,
-        #       rewards_seq,
-        #       np.asarray(rewards_seq_ptr).shape,
-        #       rewards_seq_ptr,
-        #       np.asarray(terminals_seq).shape,
-        #       np.asarray(masks_seq).shape,
-        #       np.asarray(next_obs_seq).shape,
-        # )
-        
         # Episode 정보
         ep_idx = np.searchsorted(train_dataset.initial_locs, start_idx, side="right") - 1
         ep_idx = np.clip(ep_idx, 0, len(train_dataset.initial_locs) - 1)
@@ -553,21 +712,7 @@ def main(_):
         )
 
         replay_buffer.add(td)
-
-        # Episode mapping
-        EPISODE_TO_INDICES[current_episode_id].append(cursor)
-
-        # Priority 계산
-        q = compute_quality(td, CURRENT_STAGE=CURRENT_STAGE)
-        priorities[cursor] = q
-
-        if cursor % 5000 == 0:
-            nonzero = priorities[priorities > 0]
-            print(f"[DEBUG] cursor={cursor}, pri stats: "
-                  f"min={nonzero.min():.4f}, max={nonzero.max():.4f}, "
-                  f"mean={nonzero.mean():.4f}, median={np.median(nonzero.cpu().numpy()):.4f}")
-            N = len(replay_buffer)
-            log_priority_snapshot(cursor, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
+        register_slot(cursor, current_episode_id, current_chunk_index)
 
         cursor = (cursor + 1) % capacity
         num_added += 1
@@ -575,22 +720,64 @@ def main(_):
         if num_added >= max_init_offline:
             break
 
+    # keep track of the next index whose priority should be updated when new
+    # chunks are appended (online stage continues from the offline cursor)
+    priority_cursor = cursor
+
     print(f"\n[PTR] Offline buffer filled: {num_added} chunks")
     print(f"[PTR] Unique episodes: {len(EPISODE_TO_INDICES)}")
     print(f"[PTR] Avg chunks per episode: {np.mean([len(v) for v in EPISODE_TO_INDICES.values()]):.2f}")
 
+    for ep_id in EPISODE_TO_INDICES:
+        EPISODE_TO_INDICES[ep_id] = sorted(
+            EPISODE_TO_INDICES[ep_id],
+            key=lambda i: int(storage[i]["chunk_index"].item())
+        )
+    
+    priorities = init_priorities(
+        episode_to_indices=EPISODE_TO_INDICES,
+        storage=storage,
+        priorities=priorities,
+        mode=FLAGS.priority_mode  # chunk or episode
+    )
+    
+    log_priority_snapshot(0, priorities, len(replay_buffer), CURRENT_STAGE="after_init")
+
+    existing_eps = list(EPISODE_TO_INDICES.keys())
+    max_existing_ep = max(existing_eps) if len(existing_eps) > 0 else -1
+    next_episode_id = max_existing_ep + 1
+
     # ==================================================================
-    # Offline RL
+    # TR trajectory index 정렬 & active set 초기화
+    # ==================================================================
+    
+    build_traj_index(storage, EPISODE_TO_INDICES)
+    
+    active_trajs, available_eps, ep_ids, ep_scores = init_active_trajs(
+            EPISODE_TO_INDICES, priorities, num_active=batch_size_offline,
+        )
+
+    # ==================================================================
+    # Offline RL Training
     # ==================================================================
     
     offline_init_time = time.time()
     print(f"\n[Offline RL] Starting {FLAGS.offline_steps} steps")
+    print(f"[PTR] Using {FLAGS.priority_mode} mode for priority calculation")
     
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
         log_step += 1
-        
-        # PTR 기반 batch 샘플
-        batch_td = replay_buffer.sample(batch_size=config["batch_size"])
+
+        # TR-style backward sampling
+        batch_td, active_trajs, available_eps = sample_traj_batch(
+            storage=storage,
+            episode_to_indices=EPISODE_TO_INDICES,
+            ep_ids=ep_ids,
+            ep_scores=ep_scores,
+            active_trajs=active_trajs,
+            available_eps=available_eps,
+            batch_size=config["batch_size"],
+        )
 
         rewards = batch_td["rewards"]
         if rewards.ndim == 3 and rewards.shape[-1] == 1:
@@ -619,7 +806,6 @@ def main(_):
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)
 
-        # TR 업데이트
         if i % TR_INTERVAL == 0:
             update_with_tr_lite(
                 agent=agent,
@@ -631,7 +817,6 @@ def main(_):
                 logger=logger,
                 log_step=log_step,
             )
-
         # Evaluation
         if (
             i == FLAGS.offline_steps - 1
@@ -650,16 +835,14 @@ def main(_):
         
         if i % 5000 == 0:
             N = len(replay_buffer)
-            log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
-
-
+            log_priority_snapshot(i, priorities, N, CURRENT_STAGE=f"offline_step_{i}")
+    
     # ==================================================================
     # Online RL
     # ==================================================================
     data = defaultdict(list)
     online_init_time = time.time()
 
-    # ---- 온라인 시작 전 초기화 ----
     H = FLAGS.horizon_length
     action_dim = example_batch["actions"].shape[-1]
 
@@ -669,7 +852,11 @@ def main(_):
 
     update_info = {}
 
-    cursor=0
+    priority_cursor = priority_cursor % capacity
+    current_online_episode_id = next_episode_id
+    next_episode_id += 1
+    online_chunk_index = 0
+    online_chunk_start_step = 0
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         CURRENT_STAGE="online_add"
@@ -767,6 +954,9 @@ def main(_):
                     valid_seq[t_idx:] = 0.0
                     break
 
+            chunk_start_step = online_chunk_start_step
+            chunk_index_value = online_chunk_index
+
             td = TensorDict(
                 {
                     "observations": torch.from_numpy(obs0).float(),
@@ -777,27 +967,35 @@ def main(_):
                     "masks": torch.from_numpy(masks_seq).unsqueeze(-1).float(),
                     "next_observations": torch.from_numpy(next_obs_seq).float(),
                     "valid": torch.from_numpy(valid_seq).float(),
+                    "episode_id": torch.tensor(current_online_episode_id, dtype=torch.int32),
+                    "chunk_start_step": torch.tensor(int(chunk_start_step), dtype=torch.int32),
+                    "chunk_index": torch.tensor(int(chunk_index_value), dtype=torch.int32),
                 },
                 batch_size=[],
             )
 
             replay_buffer.add(td)
+            deregister_slot(priority_cursor)
+            register_slot(priority_cursor, current_online_episode_id, chunk_index_value)
             # debug quality
             q = compute_quality(td, CURRENT_STAGE=CURRENT_STAGE)
-            priorities[cursor] = q
+            priorities[priority_cursor] = q
 
-            if cursor % 1000 == 0:
+            if priority_cursor % 1000 == 0:
                 N = len(replay_buffer)
-                log_priority_snapshot(i, priorities, N, CURRNET_STAGE=CURRENT_STAGE)
-            cursor = (cursor + 1) % capacity
+                log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
+            priority_cursor = (priority_cursor + 1) % capacity
+            online_chunk_index += 1
+            online_chunk_start_step += 1
 
-        # -----------------------------------------------------------
-        # 에피소드 종료 처리
-        # -----------------------------------------------------------
         if done:
             ob, _ = env.reset()
             action_queue = []
             trans_window.clear()
+            current_online_episode_id = next_episode_id
+            next_episode_id += 1
+            online_chunk_index = 0
+            online_chunk_start_step = 0
         else:
             ob = next_ob
 
@@ -870,7 +1068,7 @@ def main(_):
         # debug log priority
         if i % 1000 == 0:
             N = len(replay_buffer)
-            log_priority_snapshot(i, priorities, N, CURRNET_STAGE=CURRENT_STAGE)
+            log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
 
     end_time = time.time()
 
@@ -911,651 +1109,14 @@ def main(_):
         df_snap.to_csv(csv_path_snap, index=False)
         print(f"[PTR] Snapshot logs saved to {csv_path_snap}")
 
+    # === TR Debug log ===
+    if len(TR_DEBUG_LOGS) > 0:
+        df_tr = pd.DataFrame(TR_DEBUG_LOGS)
+        csv_path_tr = os.path.join(FLAGS.save_dir, "tr_debug.csv")
+        df_tr.to_csv(csv_path_tr, index=False)
+        print(f"[TR] Debug logs saved to {csv_path_tr}")
+
+
 
 if __name__ == '__main__':
     app.run(main)
-
-# import os
-# import glob
-# import json
-# import random
-# import time
-# import tqdm
-# from collections import defaultdict, deque
-# from typing import Dict
-
-# import numpy as np
-# import torch
-
-# from absl import app, flags
-# from ml_collections import config_flags
-
-# import wandb
-# from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
-
-# from envs.env_utils import make_env_and_datasets
-# from envs.robomimic_utils import is_robomimic_env
-
-# from utils.datasets import Dataset 
-# from evaluation import evaluate
-
-# from agents.fql_ptr import ACFQLAgent_PTR, get_config as get_acfql_config
-
-# from torchrl.data import TensorDictReplayBuffer
-# from torchrl.data.replay_buffers.storages import LazyTensorStorage
-# from torchrl.data.replay_buffers.samplers import RandomSampler
-# from tensordict import TensorDict
-
-# from utils.ptr_buffer import PrioritizedChunkReplayBuffer, PrioritySampler
-
-
-# # ======================================================================
-# # Flags
-# # ======================================================================
-
-# FLAGS = flags.FLAGS
-# EPISODE_TO_INDICES = defaultdict(list)
-# TR_INTERVAL = 1000
-
-# flags.DEFINE_string('run_group', 'Debug', 'Run group.')
-# flags.DEFINE_integer('seed', 0, 'Random seed.')
-# flags.DEFINE_string('env_name', 'transport-mh-vim', 'Environment (dataset) name.')
-# flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
-
-# flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
-# flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
-# flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
-# flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
-# flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-# flags.DEFINE_integer('save_interval', -1, 'Save interval.')
-# flags.DEFINE_integer('start_training', 5000, 'when does training start')
-
-# flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
-# flags.DEFINE_float('discount', 0.99, 'discount factor')
-
-# flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
-# flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
-# flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
-
-# config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
-
-# flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
-# flags.DEFINE_bool('sparse', False, "make the task sparse reward")
-
-# flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
-
-# flags.DEFINE_string('entity', 'sophia435256-robros', 'wandb entity')
-# flags.DEFINE_string('mode', 'online', 'wandb mode')
-
-# flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
-
-# # PTR configuration
-# flags.DEFINE_float('ptr_alpha', 1.0, 'PTR priority scaling factor')
-# flags.DEFINE_float('ptr_eps_uniform', 0.2, 'Uniform sampling probability for PTR')
-# flags.DEFINE_bool('use_shaped_for_priority', True, 'Use shaped reward for priority calculation')
-
-# # Log config
-# PTR_CHUNK_LOGS = []
-# PTR_SNAPSHOT_LOGS = []
-
-# def log_priority_snapshot(step, priorities, N, CURRENT_STAGE:str = "offline_prefill"):
-#     pri = priorities[:N].detach().cpu().numpy().astype(np.float64)
-#     pri_clip = pri.copy()
-#     pri_clip[pri_clip <= 0] = 1.0
-#     p = pri_clip / (pri_clip.sum() + 1e-8)
-
-#     entropy = -np.sum(p * np.log(p + 1e-12))
-
-#     k_ratio = 0.05
-#     k = max(1, int(len(p) * k_ratio))
-#     idx_sorted = np.argsort(-p)
-#     topk_mass = p[idx_sorted[:k]].sum()
-
-#     PTR_SNAPSHOT_LOGS.append({
-#         "stage": CURRENT_STAGE,
-#         "step": int(step),
-#         "H": int(FLAGS.horizon_length),
-#         "pri_min": float(pri.min()),
-#         "pri_max": float(pri.max()),
-#         "pri_mean": float(pri.mean()),
-#         "pri_std": float(pri.std()),
-#         "entropy": float(entropy),
-#         "top5pct_mass": float(topk_mass),
-#     })
-
-# # ======================================================================
-# # Logging helper
-# # ======================================================================
-
-# class LoggingHelper:
-#     def __init__(self, csv_loggers, wandb_logger):
-#         self.csv_loggers = csv_loggers
-#         self.wandb_logger = wandb_logger
-#         self.first_time = time.time()
-#         self.last_time = time.time()
-
-#     def log(self, data, prefix, step):
-#         assert prefix in self.csv_loggers, prefix
-#         self.csv_loggers[prefix].log(data, step=step)
-#         if self.wandb_logger is not None:
-#             self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
-
-# # ======================================================================
-# # Helper: batch numpy -> torch
-# # ======================================================================
-
-# def numpy_batch_to_torch(batch, device):
-#     torch_batch = {}
-#     for k, v in batch.items():
-#         arr = np.asarray(v)
-#         if arr.dtype == np.bool_:
-#             t = torch.from_numpy(arr.astype(np.float32))
-#         elif np.issubdtype(arr.dtype, np.integer):
-#             t = torch.from_numpy(arr.astype(np.int64))
-#         else:
-#             t = torch.from_numpy(arr.astype(np.float32))
-#         torch_batch[k] = t.to(device)
-#     return torch_batch
-
-# # ======================================================================
-# # PTR: compute chunk-level quality (FIXED)
-# # ======================================================================
-
-# def compute_quality(td, CURRENT_STAGE="offline_prefill"):
-#     """
-#     개선된 PTR priority 계산:
-#     - shaped reward 사용 (학습과 일관성)
-#     - offline/online 통합
-#     - 더 안정적인 통계량 계산
-#     """
-#     # 1) Shaped reward 사용 (FLAGS에 따라 선택 가능)
-#     if FLAGS.use_shaped_for_priority:
-#         rewards = td["rewards"].squeeze(-1).cpu().numpy()  # [H]
-#     else:
-#         rewards = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
-    
-#     valid = td["valid"].cpu().numpy().astype(bool)
-#     r_valid = rewards[valid]
-    
-#     if r_valid.size == 0:
-#         return 1e-3
-
-#     # 2) 통계량 계산
-#     traj_return = float(r_valid.sum())
-#     avg_r = float(r_valid.mean())
-
-#     # Upper quartile mean (UQM)
-#     k = max(1, int(0.25 * r_valid.size))
-#     topk = np.partition(r_valid, -k)[-k:]
-#     uqm = float(topk.mean())
-
-#     min_r = float(r_valid.min())
-#     max_r = float(r_valid.max())
-
-#     # 3) Priority 계산 (논문의 weighted combination)
-#     # Return + Avg + UQM이 주요 지표
-#     q = traj_return + 0.5 * avg_r + 0.5 * uqm
-    
-#     # Robomimic 환경의 경우: 성공 판별 추가
-#     if is_robomimic_env(FLAGS.env_name):
-#         # 원본 reward로 성공 여부 판단
-#         rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()
-#         r_ptr_valid = rewards_ptr[valid]
-#         success_reward = r_ptr_valid.sum()
-        
-#         # 성공 시 추가 보너스
-#         if success_reward > 0.5:
-#             q += 10.0  # 성공한 trajectory에 높은 priority
-    
-#     # 음수 방지
-#     q = float(max(q, 1e-6))
-    
-#     # 스케일링 (FLAGS.ptr_alpha 적용)
-#     q = q * FLAGS.ptr_alpha
-
-#     PTR_CHUNK_LOGS.append({
-#         "stage": CURRENT_STAGE,
-#         "traj_return": traj_return,
-#         "avg_r": avg_r,
-#         "uqm": uqm,
-#         "min_r": min_r,
-#         "max_r": max_r,
-#         "quality": q,
-#     })
-
-#     return q
-
-    
-# # ======================================================================
-# # PTR: Weighted Backward Update based on TR (FIXED)
-# # ======================================================================
-
-# def get_chunks_by_episode(ep_id: int, storage, episode_to_indices):
-#     """ep_id에 해당하는 모든 chunk들을 (idx, TensorDict) 리스트로 반환."""
-#     idx_list = episode_to_indices.get(ep_id, [])
-#     pairs = []
-#     for idx in idx_list:
-#         if idx < len(storage):  # 안전성 체크
-#             td = storage[idx]
-#             pairs.append((idx, td))
-#     return pairs
-
-
-# def convert_td_to_batch(td: TensorDict) -> Dict[str, torch.Tensor]:
-#     """TensorDict를 ACFQLAgent.update_critic용 batch dict로 변환."""
-#     rewards = td["rewards"]
-#     if rewards.ndim == 2 and rewards.shape[-1] == 1:
-#         rewards = rewards.squeeze(-1)
-
-#     masks = td["masks"]
-#     if masks.ndim == 2 and masks.shape[-1] == 1:
-#         masks = masks.squeeze(-1)
-
-#     terminals = td["terminals"]
-#     if terminals.ndim == 2 and terminals.shape[-1] == 1:
-#         terminals = terminals.squeeze(-1)
-
-#     batch = {
-#         "observations": td["observations"].unsqueeze(0),
-#         "actions": td["actions"].unsqueeze(0),
-#         "rewards": rewards.unsqueeze(0),
-#         "terminals": terminals.unsqueeze(0),
-#         "masks": masks.unsqueeze(0),
-#         "next_observations": td["next_observations"].unsqueeze(0),
-#         "valid": td["valid"].unsqueeze(0),
-#     }
-
-#     return batch
-
-
-# def update_with_tr_lite(agent,
-#                         replay_buffer,
-#                         sampler,
-#                         storage,
-#                         gamma,
-#                         H,
-#                         logger,
-#                         log_step):
-#     """
-#     PTR-TR 업데이트 (개선):
-#     - backward return 계산
-#     - critic + priority 업데이트
-#     - target network soft update 추가
-#     """
-#     # 1. chunk 하나 샘플
-#     td_batch = replay_buffer.sample(1)
-#     ep_id = int(td_batch["episode_id"][0].item())
-
-#     # 2. 해당 episode 전체 chunk 리스트
-#     idx_td_list = get_chunks_by_episode(ep_id, storage, EPISODE_TO_INDICES)
-#     if len(idx_td_list) == 0:
-#         return
-
-#     # chunk_index 기준 정렬
-#     idx_td_list = sorted(
-#         idx_td_list,
-#         key=lambda pair: int(pair[1]["chunk_index"].item())
-#     )
-
-#     # 3. Backward return 계산
-#     G = 0.0
-#     returns = []
-#     for idx, c in reversed(idx_td_list):
-#         r = c["rewards"]
-#         if r.ndim == 2 and r.shape[-1] == 1:
-#             r = r.squeeze(-1)
-#         if "valid" in c.keys():
-#             v = c["valid"].to(r.dtype)
-#         else:
-#             v = torch.ones_like(r)
-
-#         R_k = float((r * v).sum().item())
-#         G = R_k + (gamma ** H) * G
-#         returns.append(G)
-
-#     returns.reverse()
-
-#     # 4. Critic + priority 업데이트
-#     all_indices = []
-#     all_priorities = []
-
-#     for (idx, chunk_td), G_k in zip(idx_td_list, returns):
-#         batch = convert_td_to_batch(chunk_td)
-#         ptr_critic_info = agent.update_critic(batch, G_k)
-#         logger.log(ptr_critic_info, "offline_agent", step=log_step)
-
-#         all_indices.append(idx)
-#         # Priority는 G_k 자체가 아니라, quality 재계산
-#         q_new = compute_quality(chunk_td, CURRENT_STAGE="tr_update")
-#         all_priorities.append(q_new)
-
-#     # Sampler에 priority 업데이트
-#     if len(all_indices) > 0:
-#         indices_tensor = torch.tensor(all_indices, dtype=torch.long)
-#         pri_tensor = torch.tensor(all_priorities, dtype=torch.float32)
-#         sampler.update_priority(indices_tensor, pri_tensor)
-
-
-# # ======================================================================
-# # Main
-# # ======================================================================
-
-# def main(_):
-#     # Wandb & exp name
-#     exp_name = get_exp_name(FLAGS.seed)
-#     run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name,
-#                       entity=FLAGS.entity, mode=FLAGS.mode)
-
-#     FLAGS.save_dir = os.path.join(
-#         FLAGS.save_dir,
-#         wandb.run.project,
-#         FLAGS.run_group,
-#         FLAGS.env_name,
-#         exp_name,
-#     )
-#     os.makedirs(FLAGS.save_dir, exist_ok=True)
-#     flag_dict = get_flag_dict()
-
-#     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
-#         json.dump(flag_dict, f)
-
-#     # Config
-#     config = dict(get_acfql_config())
-#     config["horizon_length"] = FLAGS.horizon_length
-
-#     # Env & dataset
-#     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
-
-#     # Seed
-#     random.seed(FLAGS.seed)
-#     np.random.seed(FLAGS.seed)
-#     torch.manual_seed(FLAGS.seed)
-
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-#     log_step = 0
-#     discount = FLAGS.discount
-
-#     # Dataset 처리
-#     def process_train_dataset(ds):
-#         ds = Dataset.create(**ds)
-
-#         # dataset_proportion
-#         if FLAGS.dataset_proportion < 1.0:
-#             new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
-#             ds = Dataset.create(
-#                 **{k: v[:new_size] for k, v in ds.items()}
-#             )
-
-#         # PTR용 원본 보상 저장
-#         orig_rewards = ds["rewards"].copy()
-
-#         # RL 학습용 shaped reward
-#         shaped_rewards = ds["rewards"].copy()
-
-#         if is_robomimic_env(FLAGS.env_name):
-#             shaped_rewards = shaped_rewards - 1.0
-
-#         if FLAGS.sparse:
-#             shaped_rewards = (shaped_rewards != 0.0) * -1.0
-
-#         # 두 reward 모두 저장
-#         ds = ds.copy(add_or_replace={
-#             "rewards": shaped_rewards,
-#             "rewards_ptr": orig_rewards
-#         })
-
-#         return ds
-
-#     train_dataset = process_train_dataset(train_dataset)
-#     example_batch = train_dataset.sample(())
-#     print("Dataset keys:", train_dataset.keys())
-
-#     # Agent 생성
-#     agent = ACFQLAgent_PTR.create(
-#         seed=FLAGS.seed,
-#         ex_observations=np.asarray(example_batch['observations']),
-#         ex_actions=np.asarray(example_batch['actions']),
-#         config=config,
-#         device=str(device),
-#     )
-    
-#     # Logging setup
-#     prefixes = ["eval", "env"]
-#     if FLAGS.offline_steps > 0:
-#         prefixes.append("offline_agent")
-#     if FLAGS.online_steps > 0:
-#         prefixes.append("online_agent")
-
-#     logger = LoggingHelper(
-#         csv_loggers={prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv"))
-#                     for prefix in prefixes},
-#         wandb_logger=wandb,
-#     )
-
-#     # ==================================================================
-#     # Offline RL ReplayBuffer for PTR
-#     # ==================================================================
-
-#     H = FLAGS.horizon_length
-#     buffer_size = FLAGS.buffer_size
-#     capacity = FLAGS.buffer_size
-#     priorities = torch.ones(capacity)
-
-#     sampler = PrioritySampler(priorities, eps_uniform=FLAGS.ptr_eps_uniform)
-#     storage = LazyTensorStorage(capacity)
-#     batch_size_offline = config["batch_size"]
-
-#     replay_buffer = TensorDictReplayBuffer(
-#         storage=storage,
-#         sampler=sampler,
-#         batch_size=batch_size_offline,
-#     )
-
-#     # Offline dataset으로 replay 채우기
-#     CURRENT_STAGE = "offline_prefill"
-#     approx_num_chunks = train_dataset.size // H
-#     max_init_offline = min(buffer_size, approx_num_chunks)
-
-#     cursor = 0
-#     num_added = 0
-#     attempts = 0
-    
-#     # 중복 제거 로직 완화: episode만 체크
-#     seen_episodes = set()
-#     episode_chunk_counts = defaultdict(int)
-
-#     print(f"[PTR] Filling offline buffer: target={max_init_offline}")
-    
-#     while num_added < max_init_offline:
-#         attempts += 1
-#         if attempts % 10000 == 0:
-#             print(f"[DEBUG] attempts={attempts}, num_added={num_added}")
-
-#         seq = train_dataset.sample_sequence(
-#             batch_size=1,
-#             sequence_length=H,
-#             discount=discount,
-#         )
-
-#         # Numpy 변환
-#         obs_all = np.asarray(seq["observations"])
-#         actions_seq = np.asarray(seq["actions"])[0]
-#         rewards_seq = np.asarray(seq["rewards"])[0]
-#         rewards_seq_ptr = np.asarray(seq["rewards_ptr"])[0]
-#         terminals_seq = np.asarray(seq["terminals"])[0]
-#         masks_seq = np.asarray(seq["masks"])[0]
-#         next_obs_seq = np.asarray(seq["next_observations"])[0]
-
-#         ep_ids = np.asarray(seq["episode_ids"])[0]
-#         ep_steps = np.asarray(seq["episode_steps"])[0]
-
-#         current_episode_id = int(ep_ids[0])
-#         start_step_in_ep = int(ep_steps[0])
-#         current_chunk_index = start_step_in_ep // H
-
-#         # Episode 당 chunk 개수 제한 (선택적)
-#         max_chunks_per_episode = 100  # 조정 가능
-#         if episode_chunk_counts[current_episode_id] >= max_chunks_per_episode:
-#             continue
-        
-#         episode_chunk_counts[current_episode_id] += 1
-
-#         # obs 정리
-#         if obs_all.ndim == 3:
-#             obs_seq = obs_all[0]
-#         elif obs_all.ndim == 2:
-#             obs_seq = obs_all
-#         else:
-#             raise ValueError(f"Unexpected observations shape: {obs_all.shape}")
-
-#         obs0 = np.asarray(obs_seq[0], dtype=np.float32)
-#         if obs0.ndim > 1:
-#             obs0 = obs0.reshape(-1)
-
-#         # Valid mask
-#         valid_seq = np.ones(H, dtype=np.float32)
-#         for t_idx in range(1, H):
-#             if terminals_seq[t_idx - 1] > 0.5:
-#                 valid_seq[t_idx:] = 0.0
-#                 break
-
-#         # TensorDict 생성
-#         td = TensorDict(
-#             {
-#                 "observations": torch.from_numpy(obs0).float(),
-#                 "actions": torch.from_numpy(actions_seq).float(),
-#                 "rewards": torch.from_numpy(rewards_seq).unsqueeze(-1).float(),
-#                 "rewards_ptr": torch.from_numpy(rewards_seq_ptr).unsqueeze(-1).float(),
-#                 "terminals": torch.from_numpy(terminals_seq).unsqueeze(-1).float(),
-#                 "masks": torch.from_numpy(masks_seq).unsqueeze(-1).float(),
-#                 "next_observations": torch.from_numpy(next_obs_seq).float(),
-#                 "valid": torch.from_numpy(valid_seq).float(),
-#                 "episode_id": torch.tensor(current_episode_id, dtype=torch.int32),
-#                 "chunk_start_step": torch.tensor(start_step_in_ep, dtype=torch.int32),
-#                 "chunk_index": torch.tensor(current_chunk_index, dtype=torch.int32),
-#             },
-#             batch_size=[],
-#         )
-
-#         replay_buffer.add(td)
-
-#         # Episode mapping
-#         ep_id = int(td["episode_id"].item())
-#         EPISODE_TO_INDICES[ep_id].append(cursor)
-
-#         # Priority 계산
-#         q = compute_quality(td, CURRENT_STAGE=CURRENT_STAGE)
-#         priorities[cursor] = q
-
-#         if cursor % 5000 == 0:
-#             nonzero = priorities[priorities > 0]
-#             print(f"[DEBUG] cursor={cursor}, pri stats: "
-#                   f"min={nonzero.min():.4f}, max={nonzero.max():.4f}, "
-#                   f"mean={nonzero.mean():.4f}")
-#             N = len(replay_buffer)
-#             log_priority_snapshot(cursor, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
-
-#         cursor = (cursor + 1) % capacity
-#         num_added += 1
-
-#     print(f"\n[PTR] Offline buffer filled: {num_added} chunks")
-#     print(f"[PTR] Unique episodes: {len(EPISODE_TO_INDICES)}")
-#     print(f"[PTR] Avg chunks per episode: {np.mean([len(v) for v in EPISODE_TO_INDICES.values()]):.2f}")
-
-#     # ==================================================================
-#     # Offline RL
-#     # ==================================================================
-    
-#     offline_init_time = time.time()
-#     print(f"\n[Offline RL] Starting {FLAGS.offline_steps} steps")
-    
-#     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
-#         log_step += 1
-        
-#         # PTR 기반 batch 샘플
-#         batch_td = replay_buffer.sample(batch_size=config["batch_size"])
-
-#         rewards = batch_td["rewards"]
-#         if rewards.ndim == 3 and rewards.shape[-1] == 1:
-#             rewards = rewards.squeeze(-1)
-
-#         masks = batch_td["masks"]
-#         if masks.ndim == 3 and masks.shape[-1] == 1:
-#             masks = masks.squeeze(-1)
-
-#         terminals = batch_td["terminals"]
-#         if terminals.ndim == 3 and terminals.shape[-1] == 1:
-#             terminals = terminals.squeeze(-1)
-
-#         batch = {
-#             "observations": batch_td["observations"],
-#             "actions": batch_td["actions"],
-#             "rewards": rewards,
-#             "terminals": terminals,
-#             "masks": masks,
-#             "next_observations": batch_td["next_observations"],
-#             "valid": batch_td["valid"],
-#         }
-
-#         offline_info = agent.update(batch)
-
-#         if i % FLAGS.log_interval == 0:
-#             logger.log(offline_info, "offline_agent", step=log_step)
-
-#         # TR 업데이트
-#         if i % TR_INTERVAL == 0:
-#             update_with_tr_lite(
-#                 agent=agent,
-#                 replay_buffer=replay_buffer,
-#                 sampler=sampler,
-#                 storage=storage,
-#                 gamma=discount,
-#                 H=H,
-#                 logger=logger,
-#                 log_step=log_step,
-#             )
-
-#         # Evaluation
-#         if (
-#             i == FLAGS.offline_steps - 1
-#             or (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0)
-#         ):
-#             eval_info, _, _ = evaluate(
-#                 agent=agent,
-#                 env=eval_env,
-#                 action_dim=example_batch["actions"].shape[-1],
-#                 num_eval_episodes=FLAGS.eval_episodes,
-#                 num_video_episodes=FLAGS.video_episodes,
-#                 video_frame_skip=FLAGS.video_frame_skip,
-#             )
-#             print(f"\n[Eval @ step {i}] {eval_info}")
-#             logger.log(eval_info, "eval", step=log_step)
-        
-#         if i % 5000 == 0:
-#             N = len(replay_buffer)
-#             log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
-
-#     # ==================================================================
-#     # Online RL (생략 - 필요시 추가)
-#     # ==================================================================
-    
-#     # 로그 저장
-#     import pandas as pd
-
-#     if len(PTR_CHUNK_LOGS) > 0:
-#         df_chunks = pd.DataFrame(PTR_CHUNK_LOGS)
-#         csv_path_chunks = os.path.join(FLAGS.save_dir, "ptr_chunks.csv")
-#         df_chunks.to_csv(csv_path_chunks, index=False)
-#         print(f"[PTR] Chunk logs saved to {csv_path_chunks}")
-
-#     if len(PTR_SNAPSHOT_LOGS) > 0:
-#         df_snap = pd.DataFrame(PTR_SNAPSHOT_LOGS)
-#         csv_path_snap = os.path.join(FLAGS.save_dir, "ptr_snapshots.csv")
-#         df_snap.to_csv(csv_path_snap, index=False)
-#         print(f"[PTR] Snapshot logs saved to {csv_path_snap}")
-
-
-# if __name__ == '__main__':
-#     app.run(main)
-  
