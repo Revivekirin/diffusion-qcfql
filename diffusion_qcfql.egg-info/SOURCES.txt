@@ -1,10 +1,9 @@
 pyproject.toml
 setup.py
 agents/__init__.py
-agents/diffusion_qcfql.py
-agents/diffusion_qcfql_2reg.py
 agents/fql.py
 agents/fql_bc_rnn.py
+agents/fql_ptr.py
 diffusion_qcfql.egg-info/PKG-INFO
 diffusion_qcfql.egg-info/SOURCES.txt
 diffusion_qcfql.egg-info/dependency_links.txt
@@ -17,3 +16,4 @@ utils/__init__.py
 utils/datasets.py
 utils/encoders.py
 utils/networks.py
+utils/ptr_buffer.py

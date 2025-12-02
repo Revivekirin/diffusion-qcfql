@@ -89,12 +89,12 @@ def _check_dataset_exists(env_name):
     task, dataset_type, hdf5_type = env_name.split("-")
 
     if dataset_type == "mg":
-        file_name = "low_dim_sparse_v15.hdf5"
+        file_name = "low_dim_v15.hdf5"
     else:
         file_name = "low_dim_v15.hdf5"
 
     download_folder = os.path.join(
-        expanduser("/home/robros/git/diffusion-qcfql/robomimic/dataset"),
+        expanduser("/home/sophia435256/workspace2/git/diffusion-qcfql/robomimic/dataset"),
         task,
         dataset_type,
         file_name,

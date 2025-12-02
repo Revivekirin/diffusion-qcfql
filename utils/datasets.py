@@ -148,39 +148,47 @@ class Dataset(dict):
     def sample_sequence(self, batch_size, sequence_length, discount):
         """Sample sequences of length `sequence_length`.
 
-        반환 형식은 기존 JAX 버전과 동일:
-        dict(
-            observations=data['observations'].copy(),
-            full_observations=observations,
-            actions=actions,
-            masks=masks,
-            rewards=rewards,
-            terminals=terminals,
-            valid=valid,
-            next_observations=next_observations,
-            next_actions=next_actions,
-        )
+        반환 형식 (PyTorch PTR용):
+
+        - rewards        : step shaped reward 시퀀스 [B, L]
+        - returns        : shaped RTG 시퀀스 [B, L]
+        - rewards_ptr    : step raw reward 시퀀스 (있으면) [B, L]
+        - returns_ptr    : raw RTG 시퀀스 (있으면) [B, L]
+        - masks          : [B, L], 첫 done 이후 0 누적
+        - terminals      : [B, L], 첫 done 시점 이후 1 누적
+        - valid          : [B, L], t 시점에 "이 transition이 유효한가" (t-1 까지 done이면 0)
         """
+
+        # --------------------------------------------------------
+        # 0) 시작 index (에피소드 경계 무시하고 단순 uniform)
+        # --------------------------------------------------------
         idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
 
+        # 기존 코드처럼, 시작 시점 관측만 잘라 둔 dict (나중에 그대로 반환)
         data = {k: v[idxs] for k, v in self.items()}
 
-        # Pre-compute all required indices
-        all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (B, L)
-        all_idxs = all_idxs.flatten()  # (B*L,)
+        # --------------------------------------------------------
+        # 1) sequence 인덱스 전개
+        # --------------------------------------------------------
+        # all_idxs : (B, L) → flatten 해서 (B*L,)
+        all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]
+        all_idxs = all_idxs.flatten()
 
-        # Batch fetch
-        obs_all = self["observations"]
-        next_obs_all = self["next_observations"]
-        act_all = self["actions"]
-        rew_all = self["rewards"]
-        masks_all = self["masks"]
-        terms_all = self["terminals"]
+        # 원본 배열들
+        obs_all       = self["observations"]
+        next_obs_all  = self["next_observations"]
+        act_all       = self["actions"]
+        rew_all       = self["rewards"]      # shaped step reward
+        masks_all     = self["masks"]
+        terms_all     = self["terminals"]
+
         has_rewards_ptr = "rewards_ptr" in self
         if has_rewards_ptr:
-            rew_ptr_all = self["rewards_ptr"]
+            rew_ptr_all = self["rewards_ptr"]   # raw step reward
 
-        # reshape to [B, L, ...]
+        # --------------------------------------------------------
+        # 2) [B, L, ...] 형태로 모으기
+        # --------------------------------------------------------
         batch_observations = obs_all[all_idxs].reshape(
             batch_size, sequence_length, *obs_all.shape[1:]
         )
@@ -210,66 +218,254 @@ class Dataset(dict):
             batch_size, sequence_length, *act_all.shape[1:]
         )
 
-        # cumulative rewards, masks, terminals, valid
-        rewards = np.zeros((batch_size, sequence_length), dtype=float)
+        # --------------------------------------------------------
+        # 3) step reward / mask / terminal shape 정리
+        # --------------------------------------------------------
+        # rewards : [B, L] 로 통일
+        if batch_rewards.ndim == 3 and batch_rewards.shape[-1] == 1:
+            step_rewards = batch_rewards.squeeze(-1)      # [B, L]
+        elif batch_rewards.ndim == 2:
+            step_rewards = batch_rewards                  # 이미 [B, L]
+        else:
+            raise ValueError(f"Unexpected batch_rewards shape: {batch_rewards.shape}")
+
+        if has_rewards_ptr:
+            if batch_rewards_ptr.ndim == 3 and batch_rewards_ptr.shape[-1] == 1:
+                step_rewards_ptr = batch_rewards_ptr.squeeze(-1)  # [B, L]
+            elif batch_rewards_ptr.ndim == 2:
+                step_rewards_ptr = batch_rewards_ptr
+            else:
+                raise ValueError(f"Unexpected batch_rewards_ptr shape: {batch_rewards_ptr.shape}")
+
+        # masks : [B, L]
+        if batch_masks.ndim == 3 and batch_masks.shape[-1] == 1:
+            masks_step = batch_masks.squeeze(-1)
+        elif batch_masks.ndim == 2:
+            masks_step = batch_masks
+        else:
+            raise ValueError(f"Unexpected batch_masks shape: {batch_masks.shape}")
+
+        # terminals : [B, L]
+        if batch_terminals.ndim == 3 and batch_terminals.shape[-1] == 1:
+            terminals_step = batch_terminals.squeeze(-1)
+        elif batch_terminals.ndim == 2:
+            terminals_step = batch_terminals
+        else:
+            raise ValueError(f"Unexpected batch_terminals shape: {batch_terminals.shape}")
+
+        # --------------------------------------------------------
+        # 4) masks / terminals / valid / RTG 계산
+        # --------------------------------------------------------
         masks = np.ones((batch_size, sequence_length), dtype=float)
         terminals = np.zeros((batch_size, sequence_length), dtype=float)
         valid = np.ones((batch_size, sequence_length), dtype=float)
 
-        rewards[:, 0] = batch_rewards[:, 0].squeeze()
-        masks[:, 0] = batch_masks[:, 0].squeeze()
-        terminals[:, 0] = batch_terminals[:, 0].squeeze()
+        masks[:, 0] = masks_step[:, 0]
+        terminals[:, 0] = terminals_step[:, 0]
+
+        # RTG (shaped)
+        returns = np.zeros_like(step_rewards, dtype=float)
+        returns[:, 0] = step_rewards[:, 0]
+
+        if has_rewards_ptr:
+            returns_ptr = np.zeros_like(step_rewards_ptr, dtype=float)
+            returns_ptr[:, 0] = step_rewards_ptr[:, 0]
+        else:
+            returns_ptr = None
 
         discount_powers = discount ** np.arange(sequence_length)
-        for i in range(1, sequence_length):
-            r_i = batch_rewards[:, i].squeeze()
-            m_i = batch_masks[:, i].squeeze()
-            t_i = batch_terminals[:, i].squeeze()
 
-            rewards[:, i] = rewards[:, i - 1] + r_i * discount_powers[i]
-            masks[:, i] = np.minimum(masks[:, i - 1], m_i)
-            terminals[:, i] = np.maximum(terminals[:, i - 1], t_i)
-            valid[:, i] = 1.0 - terminals[:, i - 1]
+        for t in range(1, sequence_length):
+            r_t = step_rewards[:, t]          # [B]
+            m_t = masks_step[:, t]
+            d_t = terminals_step[:, t]
 
-        # observations 포맷
-        if batch_observations.ndim == 5:  # (B, L, H, W, C) 가정
-            # (B, H, W, L, C) 로 transpose (원 코드와 동일)
+            # 누적 RTG (discounted return)
+            returns[:, t] = returns[:, t - 1] + r_t * discount_powers[t]
+            if has_rewards_ptr:
+                r_ptr_t = step_rewards_ptr[:, t]
+                returns_ptr[:, t] = returns_ptr[:, t - 1] + r_ptr_t * discount_powers[t]
+
+            # mask / terminal / valid 업데이트 (에피소드 진행 상태)
+            masks[:, t] = np.minimum(masks[:, t - 1], m_t)
+            terminals[:, t] = np.maximum(terminals[:, t - 1], d_t)
+            valid[:, t] = 1.0 - terminals[:, t - 1]
+
+        # --------------------------------------------------------
+        # 5) 추가 메타정보: episode_ids / episode_steps
+        #    (EPISODE_TO_INDICES에서 쓰는 값들)
+        # --------------------------------------------------------
+        # self.initial_locs: 각 episode 시작 인덱스
+        ep_idx = np.searchsorted(self.initial_locs, all_idxs, side="right") - 1
+        ep_idx = np.clip(ep_idx, 0, len(self.initial_locs) - 1)
+
+        ep_steps_flat = all_idxs - self.initial_locs[ep_idx]   # episode 내 step index
+        episode_ids = ep_idx.reshape(batch_size, sequence_length).astype(np.int32)
+        episode_steps = ep_steps_flat.reshape(batch_size, sequence_length).astype(np.int32)
+
+        # --------------------------------------------------------
+        # 6) observations 포맷 맞추기 (원래 코드 유지)
+        # --------------------------------------------------------
+        if batch_observations.ndim == 5:  # (B, L, H, W, C)
             full_observations = batch_observations.transpose(0, 2, 3, 1, 4)
             next_observations = batch_next_observations.transpose(0, 2, 3, 1, 4)
         else:
-            # state: (B, L, D)
-            full_observations = batch_observations
+            full_observations = batch_observations      # (B, L, D)
             next_observations = batch_next_observations
 
         actions = batch_actions
         next_actions = batch_next_actions
 
-        ep_idx = np.searchsorted(self.initial_locs, all_idxs, side="right") - 1  # (B*L,)
-        ep_idx = np.clip(ep_idx, 0, len(self.initial_locs) - 1)
-
-        ep_steps_flat = all_idxs - self.initial_locs[ep_idx]   # episode 내 step
-        episode_ids = ep_idx.reshape(batch_size, sequence_length).astype(np.int32)
-        episode_steps = ep_steps_flat.reshape(batch_size, sequence_length).astype(np.int32)
-
-        ret =  dict(
-            observations=data["observations"].copy(),  
+        # --------------------------------------------------------
+        # 7) 반환 dict 구성
+        # --------------------------------------------------------
+        ret = dict(
+            observations=data["observations"].copy(),  # 시작 시점 관측
             full_observations=full_observations,
             actions=actions,
             masks=masks,
-            rewards=rewards,
+            rewards=step_rewards,          # step shaped reward
+            returns=returns,               # shaped RTG
             terminals=terminals,
             valid=valid,
             next_observations=next_observations,
             next_actions=next_actions,
+            episode_ids=episode_ids,
+            episode_steps=episode_steps,
         )
-    
-        if has_rewards_ptr:
-            ret["rewards_ptr"] = batch_rewards_ptr
 
-        ret["episode_ids"] = episode_ids
-        ret["episode_steps"] = episode_steps
+        if has_rewards_ptr:
+            ret["rewards_ptr"] = step_rewards_ptr   # step raw reward
+            ret["returns_ptr"] = returns_ptr        # raw RTG
 
         return ret
+
+
+    # def sample_sequence(self, batch_size, sequence_length, discount):
+    #     """Sample sequences of length `sequence_length`.
+
+    #     반환 형식은 기존 JAX 버전과 동일:
+    #     dict(
+    #         observations=data['observations'].copy(),
+    #         full_observations=observations,
+    #         actions=actions,
+    #         masks=masks,
+    #         rewards=rewards,
+    #         terminals=terminals,
+    #         valid=valid,
+    #         next_observations=next_observations,
+    #         next_actions=next_actions,
+    #     )
+    #     """
+    #     idxs = np.random.randint(self.size - sequence_length + 1, size=batch_size)
+
+    #     data = {k: v[idxs] for k, v in self.items()}
+
+    #     # Pre-compute all required indices
+    #     all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]  # (B, L)
+    #     all_idxs = all_idxs.flatten()  # (B*L,)
+
+    #     # Batch fetch
+    #     obs_all = self["observations"]
+    #     next_obs_all = self["next_observations"]
+    #     act_all = self["actions"]
+    #     rew_all = self["rewards"]
+    #     masks_all = self["masks"]
+    #     terms_all = self["terminals"]
+    #     has_rewards_ptr = "rewards_ptr" in self
+    #     if has_rewards_ptr:
+    #         rew_ptr_all = self["rewards_ptr"]
+
+    #     # reshape to [B, L, ...]
+    #     batch_observations = obs_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *obs_all.shape[1:]
+    #     )
+    #     batch_next_observations = next_obs_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *next_obs_all.shape[1:]
+    #     )
+    #     batch_actions = act_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *act_all.shape[1:]
+    #     )
+    #     batch_rewards = rew_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *rew_all.shape[1:]
+    #     )
+    #     batch_masks = masks_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *masks_all.shape[1:]
+    #     )
+    #     batch_terminals = terms_all[all_idxs].reshape(
+    #         batch_size, sequence_length, *terms_all.shape[1:]
+    #     )
+    #     if has_rewards_ptr:
+    #         batch_rewards_ptr = rew_ptr_all[all_idxs].reshape(
+    #             batch_size, sequence_length, *rew_ptr_all.shape[1:]
+    #         )
+
+    #     # next_actions
+    #     next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
+    #     batch_next_actions = act_all[next_action_idxs].reshape(
+    #         batch_size, sequence_length, *act_all.shape[1:]
+    #     )
+
+    #     # cumulative rewards, masks, terminals, valid
+    #     rewards = np.zeros((batch_size, sequence_length), dtype=float)
+    #     masks = np.ones((batch_size, sequence_length), dtype=float)
+    #     terminals = np.zeros((batch_size, sequence_length), dtype=float)
+    #     valid = np.ones((batch_size, sequence_length), dtype=float)
+
+    #     rewards[:, 0] = batch_rewards[:, 0].squeeze()
+    #     masks[:, 0] = batch_masks[:, 0].squeeze()
+    #     terminals[:, 0] = batch_terminals[:, 0].squeeze()
+
+    #     discount_powers = discount ** np.arange(sequence_length)
+    #     for i in range(1, sequence_length):
+    #         r_i = batch_rewards[:, i].squeeze()
+    #         m_i = batch_masks[:, i].squeeze()
+    #         t_i = batch_terminals[:, i].squeeze()
+
+    #         rewards[:, i] = rewards[:, i - 1] + r_i * discount_powers[i]
+    #         masks[:, i] = np.minimum(masks[:, i - 1], m_i)
+    #         terminals[:, i] = np.maximum(terminals[:, i - 1], t_i)
+    #         valid[:, i] = 1.0 - terminals[:, i - 1]
+
+    #     # observations 포맷
+    #     if batch_observations.ndim == 5:  # (B, L, H, W, C) 가정
+    #         # (B, H, W, L, C) 로 transpose (원 코드와 동일)
+    #         full_observations = batch_observations.transpose(0, 2, 3, 1, 4)
+    #         next_observations = batch_next_observations.transpose(0, 2, 3, 1, 4)
+    #     else:
+    #         # state: (B, L, D)
+    #         full_observations = batch_observations
+    #         next_observations = batch_next_observations
+
+    #     actions = batch_actions
+    #     next_actions = batch_next_actions
+
+    #     ep_idx = np.searchsorted(self.initial_locs, all_idxs, side="right") - 1  # (B*L,)
+    #     ep_idx = np.clip(ep_idx, 0, len(self.initial_locs) - 1)
+
+    #     ep_steps_flat = all_idxs - self.initial_locs[ep_idx]   # episode 내 step
+    #     episode_ids = ep_idx.reshape(batch_size, sequence_length).astype(np.int32)
+    #     episode_steps = ep_steps_flat.reshape(batch_size, sequence_length).astype(np.int32)
+
+    #     ret =  dict(
+    #         observations=data["observations"].copy(),  
+    #         full_observations=full_observations,
+    #         actions=actions,
+    #         masks=masks,
+    #         rewards=rewards,
+    #         terminals=terminals,
+    #         valid=valid,
+    #         next_observations=next_observations,
+    #         next_actions=next_actions,
+    #     )
+    
+    #     if has_rewards_ptr:
+    #         ret["rewards_ptr"] = batch_rewards_ptr
+
+    #     ret["episode_ids"] = episode_ids
+    #     ret["episode_steps"] = episode_steps
+
+    #     return ret
 
     # ------------------------------------------------------------------
     # Augmentation

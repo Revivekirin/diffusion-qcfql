@@ -749,7 +749,7 @@ def main(_):
         # Online 학습
         # ---------------------------------------------------------------
         if i >= FLAGS.start_training and len(replay_buffer) >= buffer_size:
-            batch_td = replay_buffer.sample(batch_size=buffer_size)
+            batch_td = replay_buffer.sample(batch_size = config["batch_size"])
             # batch_td field shapes:
             #  observations      : [B, obs_dim]
             #  actions           : [B, H, act_dim]
