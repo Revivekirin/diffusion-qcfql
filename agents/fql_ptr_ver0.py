@@ -90,32 +90,21 @@ class ACFQLAgent_PTR:
         print(next(self.critic.value_nets[0].layers[0].parameters()).device)
 
         # Optimizers
-        critic_params = list(self.critic.parameters())
-        actor_params = (
+        all_params = (
+            list(self.critic.parameters()) +
             list(self.actor_bc_flow.parameters()) +
             list(self.actor_onestep_flow.parameters())
         )
+        
         if config.get('weight_decay', 0) > 0:
-            self.critic_optimizer = torch.optim.AdamW(
-                critic_params,
+            self.optimizer = torch.optim.AdamW(
+                all_params, 
                 lr=config['lr'],
-                weight_decay=config['weight_decay'],
-            )
-            self.actor_optimizer = torch.optim.AdamW(
-                actor_params,
-                lr=config['lr'],
-                weight_decay=config['weight_decay'],
+                weight_decay=config['weight_decay']
             )
         else:
-            self.critic_optimizer = torch.optim.Adam(
-                critic_params,
-                lr=config['lr'],
-            )
-            self.actor_optimizer = torch.optim.Adam(
-                actor_params,
-                lr=config['lr'],
-            )
-
+            self.optimizer = torch.optim.Adam(all_params, lr=config['lr'])
+            
         self.step = 0
         
     def _get_encoder_config(self, encoder_name: str):
@@ -245,60 +234,47 @@ class ACFQLAgent_PTR:
             'distill_loss': distill_loss.item(),
         }
     
-    def update_critic(
-        self,
-        batch: Dict[str, Tensor],
-        target_q: Optional[Tensor] = None,
-    ) -> Dict[str, float]:
+    def update_critic(self, batch: Dict[str, Tensor], target_q: Tensor) -> Dict[str, float]:
         """
-        Critic만 업데이트:
-        - target_q is None  -> 일반 TD 업데이트 (offline/online)
-        - target_q is Tensor -> TR에서 주어진 return 기반 업데이트
+        TR에서 계산한 고정 target_q 를 가지고 critic만 한 번 업데이트하는 함수.
+        - batch: convert_td_to_batch(td) 로 만든 배치 (B=1)
+        - target_q: shape [B] 또는 scalar (chunk-level return)
         """
         batch = {k: torch.as_tensor(v, device=self.device) for k, v in batch.items()}
 
-        self.critic_optimizer.zero_grad()
-
-        if target_q is None:
-            critic_loss, critic_info = self.critic_loss(batch)
-            critic_loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
-            self.critic_optimizer.step()
-
-            self._target_update()
-
-            info = {f"critic/{k}": v for k, v in critic_info.items()}
-            return info
-
         if self.config['action_chunking']:
-            batch_actions = batch['actions'].reshape(batch['actions'].shape[0], -1)  
+            batch_actions = batch['actions'].reshape(batch['actions'].shape[0], -1)  # [B, H*A]
         else:
-            batch_actions = batch['actions'][..., 0, :]  
+            batch_actions = batch['actions'][..., 0, :]  # [B, A]
 
         B = batch_actions.shape[0]
 
-        q = self.critic(batch['observations'], actions=batch_actions)  
+        q = self.critic(batch['observations'], actions=batch_actions)   # [num_qs, B]
 
         target_q = torch.as_tensor(target_q, device=self.device, dtype=q.dtype)
         if target_q.ndim == 0:
-            target_q = target_q.view(1, 1)        
+            target_q = target_q.view(1, 1)          # scalar -> [1,1]
         elif target_q.ndim == 1:
-            target_q = target_q.view(1, B)          
+            target_q = target_q.view(1, B)          # [B] -> [1,B]
         else:
             raise ValueError(f"Unexpected target_q shape: {target_q.shape}")
 
         if 'valid' in batch:
-            w = batch['valid'][..., -1].to(q.dtype)  
-            w = w.view(1, B)                         
+            w = batch['valid'][..., -1].to(q.dtype)         # [B]
+            w = w.view(1, B)                                # [1,B]
         else:
-            w = torch.ones_like(q[0:1, :])           
+            w = torch.ones_like(q[0:1, :])                  # [1,B]
 
         critic_loss = ((q - target_q) ** 2 * w).mean()
 
+        self.optimizer.zero_grad()
         critic_loss.backward()
+
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
-        self.critic_optimizer.step()
+        self.optimizer.step()
+
+        # target critic soft update
+        # self._target_update()
 
         info = {
             "critic/tr_loss": critic_loss.item(),
@@ -307,30 +283,56 @@ class ACFQLAgent_PTR:
             "critic/tr_q_min": q.min().item(),
         }
         return info
-    
-    def update_actor(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
-        """
-        Actor(BC flow + onestep flow)만 업데이트.
-        Critic은 건드리지 않음.
-        """
+
+        
+    def update(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
+        """Update the agent."""
+        # Convert batch to tensors on device
         batch = {k: torch.as_tensor(v, device=self.device) for k, v in batch.items()}
+        
+        self.optimizer.zero_grad()
 
-        self.actor_optimizer.zero_grad()
-
+        critic_loss, critic_info = self.critic_loss(batch)
         actor_loss, actor_info = self.actor_loss(batch)
-        actor_loss.backward()
+
+        total_loss = critic_loss + actor_loss
+        total_loss.backward()
+
+        # grad 통계는 여기서 (clip 전/후 둘 중 원하는 걸로)
+        grad_norms = []
+        for p in self.critic.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
+        for p in self.actor_bc_flow.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
+        for p in self.actor_onestep_flow.parameters():
+            if p.grad is not None:
+                grad_norms.append(p.grad.data.norm().item())
 
         torch.nn.utils.clip_grad_norm_(
+            list(self.critic.parameters()) +
             list(self.actor_bc_flow.parameters()) +
             list(self.actor_onestep_flow.parameters()),
             max_norm=10.0,
         )
 
-        self.actor_optimizer.step()
+        self.optimizer.step()
 
-        info = {f"actor/{k}": v for k, v in actor_info.items()}
+        # Update target network
+        self._target_update()
+        
+        self.step += 1
+        
+        info = {
+            f'critic/{k}': v for k, v in critic_info.items()
+        }
+        info.update({
+            f'actor/{k}': v for k, v in actor_info.items()
+        })
+        info['grad/norm'] = np.mean(grad_norms) if grad_norms else 0.0
+        
         return info
-    
         
     def _target_update(self):
         """Soft update of target network."""

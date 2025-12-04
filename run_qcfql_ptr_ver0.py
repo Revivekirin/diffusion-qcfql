@@ -28,7 +28,7 @@ from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from tensordict import TensorDict
 
-from utils.ptr_buffer import PrioritizedChunkReplayBuffer, PrioritySampler
+from utils.ptr_buffer import PrioritySampler
 
 
 # ======================================================================

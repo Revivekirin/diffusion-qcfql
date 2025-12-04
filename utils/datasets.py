@@ -174,11 +174,10 @@ class Dataset(dict):
         all_idxs = idxs[:, None] + np.arange(sequence_length)[None, :]
         all_idxs = all_idxs.flatten()
 
-        # 원본 배열들
         obs_all       = self["observations"]
         next_obs_all  = self["next_observations"]
         act_all       = self["actions"]
-        rew_all       = self["rewards"]      # shaped step reward
+        rew_all       = self["rewards"]      
         masks_all     = self["masks"]
         terms_all     = self["terminals"]
 
@@ -223,15 +222,15 @@ class Dataset(dict):
         # --------------------------------------------------------
         # rewards : [B, L] 로 통일
         if batch_rewards.ndim == 3 and batch_rewards.shape[-1] == 1:
-            step_rewards = batch_rewards.squeeze(-1)      # [B, L]
+            step_rewards = batch_rewards.squeeze(-1)      
         elif batch_rewards.ndim == 2:
-            step_rewards = batch_rewards                  # 이미 [B, L]
+            step_rewards = batch_rewards                  
         else:
             raise ValueError(f"Unexpected batch_rewards shape: {batch_rewards.shape}")
 
         if has_rewards_ptr:
             if batch_rewards_ptr.ndim == 3 and batch_rewards_ptr.shape[-1] == 1:
-                step_rewards_ptr = batch_rewards_ptr.squeeze(-1)  # [B, L]
+                step_rewards_ptr = batch_rewards_ptr.squeeze(-1)  
             elif batch_rewards_ptr.ndim == 2:
                 step_rewards_ptr = batch_rewards_ptr
             else:
@@ -276,7 +275,7 @@ class Dataset(dict):
         discount_powers = discount ** np.arange(sequence_length)
 
         for t in range(1, sequence_length):
-            r_t = step_rewards[:, t]          # [B]
+            r_t = step_rewards[:, t]         
             m_t = masks_step[:, t]
             d_t = terminals_step[:, t]
 
@@ -286,7 +285,7 @@ class Dataset(dict):
                 r_ptr_t = step_rewards_ptr[:, t]
                 returns_ptr[:, t] = returns_ptr[:, t - 1] + r_ptr_t * discount_powers[t]
 
-            # mask / terminal / valid 업데이트 (에피소드 진행 상태)
+            # mask / terminal / valid 업데이트
             masks[:, t] = np.minimum(masks[:, t - 1], m_t)
             terminals[:, t] = np.maximum(terminals[:, t - 1], d_t)
             valid[:, t] = 1.0 - terminals[:, t - 1]
@@ -304,7 +303,7 @@ class Dataset(dict):
         episode_steps = ep_steps_flat.reshape(batch_size, sequence_length).astype(np.int32)
 
         # --------------------------------------------------------
-        # 6) observations 포맷 맞추기 (원래 코드 유지)
+        # 6) observations 포맷 맞추기 
         # --------------------------------------------------------
         if batch_observations.ndim == 5:  # (B, L, H, W, C)
             full_observations = batch_observations.transpose(0, 2, 3, 1, 4)
@@ -320,7 +319,7 @@ class Dataset(dict):
         # 7) 반환 dict 구성
         # --------------------------------------------------------
         ret = dict(
-            observations=data["observations"].copy(),  # 시작 시점 관측
+            observations=data["observations"].copy(),  
             full_observations=full_observations,
             actions=actions,
             masks=masks,

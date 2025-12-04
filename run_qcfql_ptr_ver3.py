@@ -131,6 +131,22 @@ class LoggingHelper:
         if self.wandb_logger is not None:
             self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
+
+def debug_print_chunk(idx, storage, priorities, stage=""):
+    td = storage[idx]
+    r_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()
+    valid = td["valid"].cpu().numpy().astype(bool)
+    r_valid = r_ptr[valid]
+
+    ep_id = int(td["episode_id"].item())
+    ch_idx = int(td["chunk_index"].item())
+
+    print(f"\n[DEBUG][{stage}] idx={idx}, ep={ep_id}, chunk_idx={ch_idx}")
+    print(f"  pri      = {float(priorities[idx]):.4f}")
+    print(f"  sum_rptr = {float(r_valid.sum()):.4f}")
+    print(f"  mean_rptr= {float(r_valid.mean()):.4f}")
+    print(f"  min/max  = {float(r_valid.min()):.4f} / {float(r_valid.max()):.4f}")
+
 # ======================================================================
 # Helper: batch numpy -> torch
 # ======================================================================
@@ -159,15 +175,14 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
     - 음수 값을 양수로 변환하여 priority 할당
     - 상대적 순위 기반 접근
     """
-    # 1) 항상 원본 reward 사용 (shaped reward는 음수가 많아 priority 계산에 부적합)
+
     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
     valid = td["valid"].cpu().numpy().astype(bool)
     r_valid = rewards_ptr[valid]
     
     if r_valid.size == 0:
-        return 1.0  # 기본값
+        return 1.0  
 
-    # 2) 통계량 계산
     traj_return = float(r_valid.sum())
     avg_r = float(r_valid.mean())
     
@@ -179,7 +194,6 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
     min_r = float(r_valid.min())
     max_r = float(r_valid.max())
 
-    # 3) Priority 계산 전략 (Robomimic 최적화)
     if is_robomimic_env(FLAGS.env_name):
         # Strategy 1: 성공 여부 기반 (이진 분류)
         if traj_return > 0.5:  # 성공
@@ -191,14 +205,11 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
         else:  # 매우 나쁜 trajectory
             q = 1.0 + max(0, avg_r + 1.0) * 5.0
     else:
-        # 일반 환경: 논문의 공식 사용
         q = traj_return + 0.5 * avg_r + 0.5 * uqm
-        # 음수를 양수로 변환 (offset 추가)
         if q < 0:
-            q = np.exp(q / 10.0)  # 지수 변환으로 양수화
-        q = max(q, 0.1)  # 최소값 보장
+            q = np.exp(q / 10.0) 
+        q = max(q, 0.1) 
     
-    # 4) 스케일링
     q = q * FLAGS.ptr_alpha
     q = max(q, 0.01)  # 절대 최소값
 
@@ -213,66 +224,6 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
     })
 
     return q
-
-# def compute_quality(td, CURRENT_STAGE="offline_prefill"):
-#     """
-#     Chunk-level priority 계산:
-#     - 해당 chunk의 H-step만 보고 계산
-#     - 빠르고 세밀한 우선순위
-#     """
-#     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
-#     valid = td["valid"].cpu().numpy().astype(bool)
-#     r_valid = rewards_ptr[valid]
-    
-#     if r_valid.size == 0:
-#         return 1.0
-    
-#     # 통계량 계산
-#     traj_return = float(r_valid.sum())
-#     avg_r = float(r_valid.mean())
-    
-#     k = max(1, int(0.25 * r_valid.size))
-#     topk = np.partition(r_valid, -k)[-k:]
-#     uqm = float(topk.mean())
-    
-#     min_r = float(r_valid.min())
-#     max_r = float(r_valid.max())
-    
-#     # Priority 계산
-#     if is_robomimic_env(FLAGS.env_name):
-#         base_score = traj_return + 0.5 * avg_r + 0.5 * uqm
-        
-#         if traj_return > 0.5:
-#             q = 100.0 + np.clip(base_score * 10, 0, 100)
-#         elif traj_return > -0.5 * r_valid.size:
-#             normalized = (traj_return + 0.5 * r_valid.size) / (0.5 * r_valid.size)
-#             q = 10.0 + normalized * 90.0
-#         else:
-#             q = 1.0 + max(0, (traj_return + r_valid.size) / r_valid.size) * 9.0
-        
-#         if uqm > avg_r + 0.1:
-#             q *= 1.2
-#     else:
-#         q = traj_return + 0.5 * avg_r + 0.5 * uqm
-#         if q < 0:
-#             q = np.exp(q / 10.0)
-#         q = max(q, 0.1)
-    
-#     q = q * FLAGS.ptr_alpha
-#     q = max(q, 0.1)
-    
-#     PTR_CHUNK_LOGS.append({
-#         "stage": CURRENT_STAGE,
-#         "mode": "chunk",
-#         "traj_return": traj_return,
-#         "avg_r": avg_r,
-#         "uqm": uqm,
-#         "min_r": min_r,
-#         "max_r": max_r,
-#         "quality": q,
-#     })
-    
-#     return q
 
 
 def compute_episode_quality(ep_id, episode_to_indices, storage):
@@ -463,7 +414,7 @@ def update_with_tr_lite(agent,
         key=lambda pair: int(pair[1]["chunk_index"].item())
     )
 
-    # Backward return 계산
+    # Backward return
     G = 0.0
     returns = []
     for idx, c in reversed(idx_td_list):
@@ -494,7 +445,6 @@ def update_with_tr_lite(agent,
             logger.log(ptr_critic_info, "offline_agent", step=log_step)
     
     else:  # chunk mode
-        # Chunk mode: 각 chunk 개별 계산
         all_indices = []
         all_priorities = []
         
@@ -507,7 +457,6 @@ def update_with_tr_lite(agent,
             q_new = compute_quality(chunk_td, CURRENT_STAGE="tr_update")
             all_priorities.append(q_new)
 
-    # Priority 업데이트
     if len(all_indices) > 0:
         indices_tensor = torch.tensor(all_indices, dtype=torch.long)
         pri_tensor = torch.tensor(all_priorities, dtype=torch.float32)
@@ -617,7 +566,9 @@ def main(_):
     capacity = FLAGS.buffer_size
     priorities = torch.ones(capacity)
 
-    sampler = PrioritySampler(priorities, eps_uniform=FLAGS.ptr_eps_uniform)
+    ptr_sampler = PrioritySampler(priorities, eps_uniform=FLAGS.ptr_eps_uniform)
+    # uniform_sampler = RandomSampler()
+
     storage = LazyTensorStorage(capacity)
     batch_size_offline = config["batch_size"]
 
@@ -640,13 +591,12 @@ def main(_):
         storage_episode_ids[slot_idx] = ep_id
         storage_chunk_indices[slot_idx] = chunk_idx
 
-    replay_buffer = TensorDictReplayBuffer(
+    ptr_replay_buffer = TensorDictReplayBuffer(
         storage=storage,
-        sampler=sampler,
+        sampler=ptr_sampler,
         batch_size=batch_size_offline,
-    )
+   )
 
-    # Offline dataset으로 replay 채우기
     CURRENT_STAGE = "offline_prefill"
     approx_num_chunks = train_dataset.size // H
     max_init_offline = min(buffer_size, approx_num_chunks)
@@ -711,7 +661,7 @@ def main(_):
             batch_size=[],
         )
 
-        replay_buffer.add(td)
+        ptr_replay_buffer.add(td)
         register_slot(cursor, current_episode_id, current_chunk_index)
 
         cursor = (cursor + 1) % capacity
@@ -741,11 +691,7 @@ def main(_):
         mode=FLAGS.priority_mode  # chunk or episode
     )
     
-    log_priority_snapshot(0, priorities, len(replay_buffer), CURRENT_STAGE="after_init")
-
-    existing_eps = list(EPISODE_TO_INDICES.keys())
-    max_existing_ep = max(existing_eps) if len(existing_eps) > 0 else -1
-    next_episode_id = max_existing_ep + 1
+    log_priority_snapshot(0, priorities, len(ptr_replay_buffer), CURRENT_STAGE="after_init")
 
     # ==================================================================
     # TR trajectory index 정렬 & active set 초기화
@@ -768,55 +714,21 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
         log_step += 1
 
-        # TR-style backward sampling
-        batch_td, active_trajs, available_eps = sample_traj_batch(
-            storage=storage,
-            episode_to_indices=EPISODE_TO_INDICES,
-            ep_ids=ep_ids,
-            ep_scores=ep_scores,
-            active_trajs=active_trajs,
-            available_eps=available_eps,
-            batch_size=config["batch_size"],
+        batch_np = train_dataset.sample_sequence(
+            config['batch_size'],
+            sequence_length=FLAGS.horizon_length,
+            discount=discount,
         )
+        batch = numpy_batch_to_torch(batch_np, device=device)
 
-        rewards = batch_td["rewards"]
-        if rewards.ndim == 3 and rewards.shape[-1] == 1:
-            rewards = rewards.squeeze(-1)
-
-        masks = batch_td["masks"]
-        if masks.ndim == 3 and masks.shape[-1] == 1:
-            masks = masks.squeeze(-1)
-
-        terminals = batch_td["terminals"]
-        if terminals.ndim == 3 and terminals.shape[-1] == 1:
-            terminals = terminals.squeeze(-1)
-
-        batch = {
-            "observations": batch_td["observations"],
-            "actions": batch_td["actions"],
-            "rewards": rewards,
-            "terminals": terminals,
-            "masks": masks,
-            "next_observations": batch_td["next_observations"],
-            "valid": batch_td["valid"],
-        }
-
-        offline_info = agent.update(batch)
+        batch = numpy_batch_to_torch(batch_np, device=device)
+        offline_critic_info = agent.update_critic(batch)
+        offline_actor_info = agent.update_actor(batch)
 
         if i % FLAGS.log_interval == 0:
-            logger.log(offline_info, "offline_agent", step=log_step)
+            logger.log(offline_critic_info, "offline_agent", step=log_step)
+            logger.log(offline_actor_info, "offline_agent", step=log_step)
 
-        if i % TR_INTERVAL == 0:
-            update_with_tr_lite(
-                agent=agent,
-                replay_buffer=replay_buffer,
-                sampler=sampler,
-                storage=storage,
-                gamma=discount,
-                H=H,
-                logger=logger,
-                log_step=log_step,
-            )
         # Evaluation
         if (
             i == FLAGS.offline_steps - 1
@@ -834,7 +746,7 @@ def main(_):
             logger.log(eval_info, "eval", step=log_step)
         
         if i % 5000 == 0:
-            N = len(replay_buffer)
+            N = len(ptr_replay_buffer)
             log_priority_snapshot(i, priorities, N, CURRENT_STAGE=f"offline_step_{i}")
     
     # ==================================================================
@@ -858,7 +770,7 @@ def main(_):
     online_chunk_index = 0
     online_chunk_start_step = 0
 
-    print(f"\n[Online RL] Starting {FLAGS.offline_steps} steps")
+    print(f"\n[Online RL] Starting {FLAGS.online_steps} steps")
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         CURRENT_STAGE="online_add"
@@ -869,10 +781,10 @@ def main(_):
         if len(action_queue) == 0:
             obs_t = torch.from_numpy(np.asarray(ob, dtype=np.float32)).float().to(device)
             if obs_t.dim() == 1:
-                obs_t = obs_t.unsqueeze(0)  # [1, obs_dim]
+                obs_t = obs_t.unsqueeze(0)  
 
             with torch.no_grad():
-                action_chunk_t = agent.sample_actions(obs_t)  # [1, H*A] 또는 [1, A]
+                action_chunk_t = agent.sample_actions(obs_t)  
             action_chunk = action_chunk_t.cpu().numpy().reshape(-1, action_dim)  # [H, A] or [1, A]
 
             for a in action_chunk:
@@ -939,7 +851,7 @@ def main(_):
         # -----------------------------------------------------------
         if len(trans_window) == H:
             obs0 = np.asarray(trans_window[0]["observations"], dtype=np.float32)  # [obs_dim]
-            if obs0.shape == ():  # obs_dim=1일 때 안전 보정
+            if obs0.shape == (): 
                 obs0 = obs0.reshape(1,)
 
             actions_seq = np.stack([t["actions"] for t in trans_window], axis=0)              # [H, act_dim]
@@ -949,7 +861,6 @@ def main(_):
             masks_seq = np.stack([t["masks"] for t in trans_window], axis=0)                  # [H]
             next_obs_seq = np.stack([t["next_observations"] for t in trans_window], axis=0)   # [H, obs_dim]
 
-            # valid 마스크: 첫 terminal 이후는 0
             valid_seq = np.ones(H, dtype=np.float32)
             for t_idx in range(1, H):
                 if terminals_seq[t_idx - 1] > 0.5:
@@ -976,7 +887,7 @@ def main(_):
                 batch_size=[],
             )
 
-            replay_buffer.add(td)
+            ptr_replay_buffer.add(td)
             deregister_slot(priority_cursor)
             register_slot(priority_cursor, current_online_episode_id, chunk_index_value)
             # debug quality
@@ -984,7 +895,7 @@ def main(_):
             priorities[priority_cursor] = q
 
             if priority_cursor % 1000 == 0:
-                N = len(replay_buffer)
+                N = len(ptr_replay_buffer)
                 log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
             priority_cursor = (priority_cursor + 1) % capacity
             online_chunk_index += 1
@@ -1002,18 +913,14 @@ def main(_):
             ob = next_ob
 
         # ---------------------------------------------------------------
-        # Online 학습
+        # Online training
         # ---------------------------------------------------------------
-        if i >= FLAGS.start_training and len(replay_buffer) >= config["batch_size"]:
-            batch_td = replay_buffer.sample(batch_size=config["batch_size"])
-            # batch_td field shapes:
-            #  observations      : [B, obs_dim]
-            #  actions           : [B, H, act_dim]
-            #  rewards           : [B, H, 1]
-            #  terminals         : [B, H, 1]
-            #  masks             : [B, H, 1]
-            #  next_observations : [B, H, obs_dim]
-            #  valid             : [B, H]
+        if i >= FLAGS.start_training and len(ptr_replay_buffer) >= config["batch_size"]:
+            indices, sampler_info = ptr_sampler.sample(
+                storage=storage,
+                batch_size=config["batch_size"],
+            )
+            batch_td = storage[indices]  
 
             rewards = batch_td["rewards"]
             if rewards.ndim == 3 and rewards.shape[-1] == 1:
@@ -1028,23 +935,41 @@ def main(_):
                 terminals = terminals.squeeze(-1)
 
             batch = {
-                "observations": batch_td["observations"],             # [B, obs_dim]
-                "actions": batch_td["actions"],                       # [B, H, act_dim]
-                "rewards": rewards,                                   # [B, H]
-                "terminals": terminals,                               # [B, H]
-                "masks": masks,                                       # [B, H]
-                "next_observations": batch_td["next_observations"],   # [B, H, obs_dim]
-                "valid": batch_td["valid"],                           # [B, H]
+                "observations": batch_td["observations"],
+                "actions": batch_td["actions"],
+                "rewards": rewards,
+                "terminals": terminals,
+                "masks": masks,
+                "next_observations": batch_td["next_observations"],
+                "valid": batch_td["valid"],
             }
 
-            online_info = agent.update(batch)
-            update_info["online_agent"] = online_info
+            online_critic_info = agent.update_critic(batch)
 
+            # actor update
+            batch_np = train_dataset.sample_sequence(
+                config['batch_size'],
+                sequence_length=FLAGS.horizon_length,
+                discount=discount,
+            )
+            batch_actor = numpy_batch_to_torch(batch_np, device=device)
+            online_actor_info = agent.update_actor(batch_actor)
 
-        if i % FLAGS.log_interval == 0:
-            for key, info_ in update_info.items():
-                logger.log(info_, key, step=log_step)
-            update_info = {}
+            if i % FLAGS.log_interval == 0:
+                logger.log(online_critic_info, "online_agent", step=log_step)
+                logger.log(online_actor_info, "online_agent", step=log_step)
+
+        if i % TR_INTERVAL == 0:
+            update_with_tr_lite(
+                agent=agent,
+                replay_buffer=ptr_replay_buffer,
+                sampler=ptr_sampler,
+                storage=storage,
+                gamma=discount,
+                H=H,
+                logger=logger,
+                log_step=log_step,
+            )
 
         # eval
         if (
@@ -1069,7 +994,7 @@ def main(_):
         
         # debug log priority
         if i % 1000 == 0:
-            N = len(replay_buffer)
+            N = len(ptr_replay_buffer)
             log_priority_snapshot(i, priorities, N, CURRENT_STAGE=CURRENT_STAGE)
 
     end_time = time.time()
@@ -1095,8 +1020,6 @@ def main(_):
     with open(os.path.join(FLAGS.save_dir, 'token.tk'), 'w') as f:
         f.write(run.url)
 
-    
-    # 로그 저장
     import pandas as pd
 
     if len(PTR_CHUNK_LOGS) > 0:
@@ -1111,7 +1034,6 @@ def main(_):
         df_snap.to_csv(csv_path_snap, index=False)
         print(f"[PTR] Snapshot logs saved to {csv_path_snap}")
 
-    # === TR Debug log ===
     if len(TR_DEBUG_LOGS) > 0:
         df_tr = pd.DataFrame(TR_DEBUG_LOGS)
         csv_path_tr = os.path.join(FLAGS.save_dir, "tr_debug.csv")

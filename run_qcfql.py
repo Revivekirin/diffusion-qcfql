@@ -28,6 +28,33 @@ from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from tensordict import TensorDict
 
+## temp imports for debugging
+def print_dict_shapes(d, prefix=""):
+    """
+    dict 내부의 key별 value shape/type을 깔끔하게 출력.
+    - torch.Tensor
+    - numpy.ndarray
+    - list/tuple
+    - dict (recursive)
+    - 기타 타입 모두 지원
+    """
+    for k, v in d.items():
+        key = f"{prefix}{k}"
+
+        if isinstance(v, dict):
+            print(f"[{key}] -> dict({len(v)} keys)")
+            print_dict_shapes(v, prefix=key + ".")
+            continue
+
+        # torch tensor
+        if hasattr(v, "shape"):
+            print(f"[{key}] shape = {tuple(v.shape)}, dtype={getattr(v, 'dtype', None)}")
+        # numpy array
+        elif isinstance(v, (list, tuple)):
+            print(f"[{key}] list/tuple len = {len(v)}")
+        else:
+            print(f"[{key}] type = {type(v)} | value = {v}")
+
 
 # ======================================================================
 # Flags
@@ -98,7 +125,6 @@ def numpy_batch_to_torch(batch, device):
         elif np.issubdtype(arr.dtype, np.integer):
             t = torch.from_numpy(arr.astype(np.int64))
         else:
-            # rewards, masks, terminals, valid, obs, actions 모두 float32로 통일
             t = torch.from_numpy(arr.astype(np.float32))
 
         torch_batch[k] = t.to(device)
@@ -211,7 +237,6 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + 1)):
         log_step += 1
 
-        # (B, H, ...) 시퀀스 샘플
         batch_np = train_dataset.sample_sequence(
             config['batch_size'],
             sequence_length=FLAGS.horizon_length,
@@ -273,14 +298,7 @@ def main(_):
             sequence_length=H,
             discount=discount,
         )
-        # 아래 shape는 Dataset 구현에 따라 약간 다를 수 있음
-        # 보통:
-        #   seq["observations"]      : [1, H, obs_dim]
-        #   seq["actions"]           : [1, H, act_dim]
-        #   seq["rewards"]           : [1, H]
-        #   seq["terminals"]         : [1, H]
-        #   seq["masks"]             : [1, H]
-        #   seq["next_observations"] : [1, H, obs_dim]
+        print("[DEBUG] seq :", print_dict_shapes(seq))
 
         obs_seq = np.asarray(seq["observations"])[0]        # [H, obs_dim]
         actions_seq = np.asarray(seq["actions"])[0]         # [H, act_dim]
@@ -290,6 +308,14 @@ def main(_):
         next_obs_seq = np.asarray(seq["next_observations"])[0]  # [H, obs_dim]
 
         obs0 = np.asarray(seq["observations"][0], dtype=np.float32)  # [obs_dim]
+
+        # print("[DEBUG] obs_seq shape :", obs_seq.shape,
+        #       "actions_seq shape :", actions_seq.shape,
+        #       "rewards_seq shape :", rewards_seq.shape,
+        #       "terminals_seq shape :", terminals_seq.shape,
+        #       "masks_seq shape :", masks_seq.shape,
+        #       "next_obs_seq shape :", next_obs_seq.shape,
+        #       "obs0 shape :", obs0.shape,)
 
         # obs0는 이미 (19,) 이므로 여기서 shape 건드리지 않는 게 맞음
         assert obs0.ndim == 1, f"unexpected obs0.ndim: {obs0.ndim}"
@@ -455,14 +481,6 @@ def main(_):
         # ---------------------------------------------------------------
         if i >= FLAGS.start_training and len(replay_buffer) >= batch_size_rb:
             batch_td = replay_buffer.sample().to(device)
-            # batch_td field shapes:
-            #  observations      : [B, obs_dim]
-            #  actions           : [B, H, act_dim]
-            #  rewards           : [B, H, 1]
-            #  terminals         : [B, H, 1]
-            #  masks             : [B, H, 1]
-            #  next_observations : [B, H, obs_dim]
-            #  valid             : [B, H]
 
             rewards = batch_td["rewards"]
             if rewards.ndim == 3 and rewards.shape[-1] == 1:
