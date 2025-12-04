@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --time=24:00:00
 
-conda activate qc_dp
+conda activate qc
 
 # MUJOCO_GL=egl python run_qcfql.py \
 #  --run_group=reproduce  \
@@ -37,4 +37,3 @@ MUJOCO_GL=egl python run_qcfql_ptr_ver3.py \
  --sparse=False \
  --horizon_length=5 \
  --offline_steps=0
- 

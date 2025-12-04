@@ -7,6 +7,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import numpy as np
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 
 
 def default_init(scale=1.0):
@@ -14,6 +16,100 @@ def default_init(scale=1.0):
     def init_fn(tensor):
         return nn.init.xavier_uniform_(tensor, gain=scale)
     return init_fn
+
+
+class Actor(nn.Module):
+    """Gaussian actor network."""
+    
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dims: Sequence[int],
+        layer_norm: bool = False,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+        tanh_squash: bool = False,
+        state_dependent_std: bool = False,
+        const_std: bool = True,
+        final_fc_init_scale: float = 1e-2,
+        encoder: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        self.tanh_squash = tanh_squash
+        self.state_dependent_std = state_dependent_std
+        self.const_std = const_std
+        self.encoder = encoder
+        
+        # Actor network
+        self.actor_net = MLP(
+            [obs_dim] + list(hidden_dims),
+            activate_final=True,
+            layer_norm=layer_norm
+        )
+        
+        # Mean network
+        self.mean_net = nn.Linear(hidden_dims[-1], action_dim)
+        default_init(final_fc_init_scale)(self.mean_net.weight)
+        
+        # Std network
+        if state_dependent_std:
+            self.log_std_net = nn.Linear(hidden_dims[-1], action_dim)
+            default_init(final_fc_init_scale)(self.log_std_net.weight)
+        elif not const_std:
+            self.log_stds = nn.Parameter(torch.zeros(action_dim))
+    
+    def forward(self, observations: Tensor, temperature: float = 1.0):
+        """Return action distribution."""
+        if self.encoder is not None:
+            inputs = self.encoder(observations)
+        else:
+            inputs = observations
+            
+        outputs = self.actor_net(inputs)
+        means = self.mean_net(outputs)
+        
+        if self.state_dependent_std:
+            log_stds = self.log_std_net(outputs)
+        else:
+            if self.const_std:
+                log_stds = torch.zeros_like(means)
+            else:
+                log_stds = self.log_stds.expand_as(means)
+        
+        log_stds = torch.clamp(log_stds, self.log_std_min, self.log_std_max)
+        stds = torch.exp(log_stds) * temperature
+        
+        # Create distribution
+        dist = Normal(means, stds)
+        
+        if self.tanh_squash:
+            dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
+        
+        return dist
+    
+    def get_action_and_log_prob(self, observations: Tensor, temperature: float = 1.0):
+        """Sample action and compute log probability."""
+        dist = self.forward(observations, temperature)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        return action, log_prob
+
+
+
+class LogAlpha(nn.Module):
+    """Learnable temperature parameter."""
+    
+    def __init__(self, init_value: float = 1.0):
+        super().__init__()
+        self.log_alpha = nn.Parameter(torch.tensor(np.log(init_value)))
+    
+    def forward(self):
+        return torch.exp(self.log_alpha)
+
 
 
 class FourierFeatures(nn.Module):

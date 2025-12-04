@@ -28,33 +28,6 @@ from torchrl.data.replay_buffers.storages import LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import RandomSampler
 from tensordict import TensorDict
 
-## temp imports for debugging
-def print_dict_shapes(d, prefix=""):
-    """
-    dict 내부의 key별 value shape/type을 깔끔하게 출력.
-    - torch.Tensor
-    - numpy.ndarray
-    - list/tuple
-    - dict (recursive)
-    - 기타 타입 모두 지원
-    """
-    for k, v in d.items():
-        key = f"{prefix}{k}"
-
-        if isinstance(v, dict):
-            print(f"[{key}] -> dict({len(v)} keys)")
-            print_dict_shapes(v, prefix=key + ".")
-            continue
-
-        # torch tensor
-        if hasattr(v, "shape"):
-            print(f"[{key}] shape = {tuple(v.shape)}, dtype={getattr(v, 'dtype', None)}")
-        # numpy array
-        elif isinstance(v, (list, tuple)):
-            print(f"[{key}] list/tuple len = {len(v)}")
-        else:
-            print(f"[{key}] type = {type(v)} | value = {v}")
-
 
 # ======================================================================
 # Flags
@@ -298,7 +271,6 @@ def main(_):
             sequence_length=H,
             discount=discount,
         )
-        print("[DEBUG] seq :", print_dict_shapes(seq))
 
         obs_seq = np.asarray(seq["observations"])[0]        # [H, obs_dim]
         actions_seq = np.asarray(seq["actions"])[0]         # [H, act_dim]
@@ -309,18 +281,8 @@ def main(_):
 
         obs0 = np.asarray(seq["observations"][0], dtype=np.float32)  # [obs_dim]
 
-        # print("[DEBUG] obs_seq shape :", obs_seq.shape,
-        #       "actions_seq shape :", actions_seq.shape,
-        #       "rewards_seq shape :", rewards_seq.shape,
-        #       "terminals_seq shape :", terminals_seq.shape,
-        #       "masks_seq shape :", masks_seq.shape,
-        #       "next_obs_seq shape :", next_obs_seq.shape,
-        #       "obs0 shape :", obs0.shape,)
-
-        # obs0는 이미 (19,) 이므로 여기서 shape 건드리지 않는 게 맞음
         assert obs0.ndim == 1, f"unexpected obs0.ndim: {obs0.ndim}"
 
-        # valid 마스크: 첫 terminal 이후는 0
         valid_seq = np.ones(H, dtype=np.float32)
         for t_idx in range(1, H):
             if terminals_seq[t_idx - 1] > 0.5:

@@ -678,6 +678,12 @@ def main(_):
     print(f"[PTR] Unique episodes: {len(EPISODE_TO_INDICES)}")
     print(f"[PTR] Avg chunks per episode: {np.mean([len(v) for v in EPISODE_TO_INDICES.values()]):.2f}")
 
+    if len(EPISODE_TO_INDICES) > 0:
+        max_ep_id = max(EPISODE_TO_INDICES.keys())
+    else:
+        max_ep_id = -1
+    next_episode_id = max_ep_id + 1
+
     for ep_id in EPISODE_TO_INDICES:
         EPISODE_TO_INDICES[ep_id] = sorted(
             EPISODE_TO_INDICES[ep_id],
@@ -721,7 +727,6 @@ def main(_):
         )
         batch = numpy_batch_to_torch(batch_np, device=device)
 
-        batch = numpy_batch_to_torch(batch_np, device=device)
         offline_critic_info = agent.update_critic(batch)
         offline_actor_info = agent.update_actor(batch)
 
