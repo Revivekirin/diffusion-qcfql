@@ -30,11 +30,12 @@ conda activate qc
 # #  --eval_interval=1
 
 
-MUJOCO_GL=egl python run_qcfql_ptr_ver1.py \
+MUJOCO_GL=egl python run_qcfql_ptr_ver2.py \
  --run_group=reproduce  \
  --agent.alpha=100  \
  --env_name=transport-mg-low  \
  --sparse=False \
  --horizon_length=5 \
  --sparse=False \
- --priority_mode=episode
+ --priority_mode=chunk \ 
+ 

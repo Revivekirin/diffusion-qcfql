@@ -10,10 +10,21 @@
 
 conda activate qc_dp
 
-MUJOCO_GL=egl python run_qcfql.py \
+# MUJOCO_GL=egl python run_qcfql.py \
+#  --run_group=reproduce  \
+#  --agent.alpha=100  \
+#  --env_name=square-mh-low  \
+#  --sparse=False \
+#  --horizon_length=5 \
+# #  --eval_interval=1
+
+
+MUJOCO_GL=egl python run_qcfql_ptr_ver2.py \
  --run_group=reproduce  \
  --agent.alpha=100  \
- --env_name=square-mh-low  \
+ --env_name=square-mg-low  \
  --sparse=False \
  --horizon_length=5 \
-#  --eval_interval=1
+ --sparse=False \
+ --priority_mode=chunk \ 
+ 

@@ -8,32 +8,41 @@
 #SBATCH --cpus-per-gpu=8
 #SBATCH --time=24:00:00
 
-conda activate qc_dp
+conda activate qc
 
-MUJOCO_GL=egl python run_qcfql.py \
+MUJOCO_GL=egl python run_qcfql_ptr_ver2.py \
  --run_group=reproduce  \
  --agent.alpha=100  \
- --env_name=can-mh-low  \
+ --env_name=can-mg-low  \
  --sparse=False \
  --horizon_length=5 \
-#  --eval_interval=1
-
-
-
-# diffusion_qcfql
-MUJOCO_GL=egl python run.py \
- --run_group=reproduce  \
- --agent.alpha=100  \
- --env_name=can-mh-low  \
  --sparse=False \
- --horizon_steps=4 \
- --horizon_length=4
+ --priority_mode=chunk \ 
+
+# MUJOCO_GL=egl python run_qcfql.py \
+#  --run_group=reproduce  \
+#  --agent.alpha=100  \
+#  --env_name=can-mh-low  \
+#  --sparse=False \
+#  --horizon_length=5 \
+# #  --eval_interval=1
 
 
-MUJOCO_GL=egl python run.py  \
- --run_group=reproduce  \
- --agent.alpha=100  \
- --env_name=can-mh-low  \
- --sparse=False  \
- --horizon_length=4 \
- --horizon_steps=4
+
+# # diffusion_qcfql
+# MUJOCO_GL=egl python run.py \
+#  --run_group=reproduce  \
+#  --agent.alpha=100  \
+#  --env_name=can-mh-low  \
+#  --sparse=False \
+#  --horizon_steps=4 \
+#  --horizon_length=4
+
+
+# MUJOCO_GL=egl python run.py  \
+#  --run_group=reproduce  \
+#  --agent.alpha=100  \
+#  --env_name=can-mh-low  \
+#  --sparse=False  \
+#  --horizon_length=4 \
+#  --horizon_steps=4

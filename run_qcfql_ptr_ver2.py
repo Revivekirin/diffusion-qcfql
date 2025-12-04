@@ -152,118 +152,58 @@ def numpy_batch_to_torch(batch, device):
 # PTR: compute chunk-level quality (FIXED)
 # ======================================================================
 
-# def compute_quality(td, CURRENT_STAGE="offline_prefill"):
-#     """
-#     개선된 PTR priority 계산 (음수 reward 대응):
-#     - 원본 reward(rewards_ptr) 기반으로 quality 계산
-#     - 음수 값을 양수로 변환하여 priority 할당
-#     - 상대적 순위 기반 접근
-#     """
-#     # 1) 항상 원본 reward 사용 (shaped reward는 음수가 많아 priority 계산에 부적합)
-#     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
-#     valid = td["valid"].cpu().numpy().astype(bool)
-#     r_valid = rewards_ptr[valid]
-    
-#     if r_valid.size == 0:
-#         return 1.0  # 기본값
-
-#     # 2) 통계량 계산
-#     traj_return = float(r_valid.sum())
-#     avg_r = float(r_valid.mean())
-    
-#     # Upper quartile mean (UQM)
-#     k = max(1, int(0.25 * r_valid.size))
-#     topk = np.partition(r_valid, -k)[-k:]
-#     uqm = float(topk.mean())
-    
-#     min_r = float(r_valid.min())
-#     max_r = float(r_valid.max())
-
-#     # 3) Priority 계산 전략 (Robomimic 최적화)
-#     if is_robomimic_env(FLAGS.env_name):
-#         # Strategy 1: 성공 여부 기반 (이진 분류)
-#         if traj_return > 0.5:  # 성공
-#             q = 100.0 + traj_return * 10.0  # 높은 base + 추가 보상
-#         elif traj_return > 0.0:  # 부분 성공
-#             q = 50.0 + traj_return * 10.0
-#         elif avg_r > -0.5:  # 실패했지만 괜찮은 trajectory
-#             q = 10.0 + (avg_r + 1.0) * 10.0  # -1 penalty 보정
-#         else:  # 매우 나쁜 trajectory
-#             q = 1.0 + max(0, avg_r + 1.0) * 5.0
-#     else:
-#         # 일반 환경: 논문의 공식 사용
-#         q = traj_return + 0.5 * avg_r + 0.5 * uqm
-#         # 음수를 양수로 변환 (offset 추가)
-#         if q < 0:
-#             q = np.exp(q / 10.0)  # 지수 변환으로 양수화
-#         q = max(q, 0.1)  # 최소값 보장
-    
-#     # 4) 스케일링
-#     q = q * FLAGS.ptr_alpha
-#     q = max(q, 0.01)  # 절대 최소값
-
-#     PTR_CHUNK_LOGS.append({
-#         "stage": CURRENT_STAGE,
-#         "traj_return": traj_return,
-#         "avg_r": avg_r,
-#         "uqm": uqm,
-#         "min_r": min_r,
-#         "max_r": max_r,
-#         "quality": q,
-#     })
-
-#     return q
-
 def compute_quality(td, CURRENT_STAGE="offline_prefill"):
     """
-    Chunk-level priority 계산:
-    - 해당 chunk의 H-step만 보고 계산
-    - 빠르고 세밀한 우선순위
+    개선된 PTR priority 계산 (음수 reward 대응):
+    - 원본 reward(rewards_ptr) 기반으로 quality 계산
+    - 음수 값을 양수로 변환하여 priority 할당
+    - 상대적 순위 기반 접근
     """
+    # 1) 항상 원본 reward 사용 (shaped reward는 음수가 많아 priority 계산에 부적합)
     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
     valid = td["valid"].cpu().numpy().astype(bool)
     r_valid = rewards_ptr[valid]
     
     if r_valid.size == 0:
-        return 1.0
-    
-    # 통계량 계산
+        return 1.0  # 기본값
+
+    # 2) 통계량 계산
     traj_return = float(r_valid.sum())
     avg_r = float(r_valid.mean())
     
+    # Upper quartile mean (UQM)
     k = max(1, int(0.25 * r_valid.size))
     topk = np.partition(r_valid, -k)[-k:]
     uqm = float(topk.mean())
     
     min_r = float(r_valid.min())
     max_r = float(r_valid.max())
-    
-    # Priority 계산
+
+    # 3) Priority 계산 전략 (Robomimic 최적화)
     if is_robomimic_env(FLAGS.env_name):
-        base_score = traj_return + 0.5 * avg_r + 0.5 * uqm
-        
-        if traj_return > 0.5:
-            q = 100.0 + np.clip(base_score * 10, 0, 100)
-        elif traj_return > -0.5 * r_valid.size:
-            normalized = (traj_return + 0.5 * r_valid.size) / (0.5 * r_valid.size)
-            q = 10.0 + normalized * 90.0
-        else:
-            q = 1.0 + max(0, (traj_return + r_valid.size) / r_valid.size) * 9.0
-        
-        if uqm > avg_r + 0.1:
-            q *= 1.2
+        # Strategy 1: 성공 여부 기반 (이진 분류)
+        if traj_return > 0.5:  # 성공
+            q = 100.0 + traj_return * 10.0  # 높은 base + 추가 보상
+        elif traj_return > 0.0:  # 부분 성공
+            q = 50.0 + traj_return * 10.0
+        elif avg_r > -0.5:  # 실패했지만 괜찮은 trajectory
+            q = 10.0 + (avg_r + 1.0) * 10.0  # -1 penalty 보정
+        else:  # 매우 나쁜 trajectory
+            q = 1.0 + max(0, avg_r + 1.0) * 5.0
     else:
+        # 일반 환경: 논문의 공식 사용
         q = traj_return + 0.5 * avg_r + 0.5 * uqm
+        # 음수를 양수로 변환 (offset 추가)
         if q < 0:
-            q = np.exp(q / 10.0)
-        q = max(q, 0.1)
+            q = np.exp(q / 10.0)  # 지수 변환으로 양수화
+        q = max(q, 0.1)  # 최소값 보장
     
+    # 4) 스케일링
     q = q * FLAGS.ptr_alpha
-    q = max(q, 0.1)
-    
+    q = max(q, 0.01)  # 절대 최소값
+
     PTR_CHUNK_LOGS.append({
         "stage": CURRENT_STAGE,
-        "mode": "chunk",
         "traj_return": traj_return,
         "avg_r": avg_r,
         "uqm": uqm,
@@ -271,8 +211,68 @@ def compute_quality(td, CURRENT_STAGE="offline_prefill"):
         "max_r": max_r,
         "quality": q,
     })
-    
+
     return q
+
+# def compute_quality(td, CURRENT_STAGE="offline_prefill"):
+#     """
+#     Chunk-level priority 계산:
+#     - 해당 chunk의 H-step만 보고 계산
+#     - 빠르고 세밀한 우선순위
+#     """
+#     rewards_ptr = td["rewards_ptr"].squeeze(-1).cpu().numpy()  # [H]
+#     valid = td["valid"].cpu().numpy().astype(bool)
+#     r_valid = rewards_ptr[valid]
+    
+#     if r_valid.size == 0:
+#         return 1.0
+    
+#     # 통계량 계산
+#     traj_return = float(r_valid.sum())
+#     avg_r = float(r_valid.mean())
+    
+#     k = max(1, int(0.25 * r_valid.size))
+#     topk = np.partition(r_valid, -k)[-k:]
+#     uqm = float(topk.mean())
+    
+#     min_r = float(r_valid.min())
+#     max_r = float(r_valid.max())
+    
+#     # Priority 계산
+#     if is_robomimic_env(FLAGS.env_name):
+#         base_score = traj_return + 0.5 * avg_r + 0.5 * uqm
+        
+#         if traj_return > 0.5:
+#             q = 100.0 + np.clip(base_score * 10, 0, 100)
+#         elif traj_return > -0.5 * r_valid.size:
+#             normalized = (traj_return + 0.5 * r_valid.size) / (0.5 * r_valid.size)
+#             q = 10.0 + normalized * 90.0
+#         else:
+#             q = 1.0 + max(0, (traj_return + r_valid.size) / r_valid.size) * 9.0
+        
+#         if uqm > avg_r + 0.1:
+#             q *= 1.2
+#     else:
+#         q = traj_return + 0.5 * avg_r + 0.5 * uqm
+#         if q < 0:
+#             q = np.exp(q / 10.0)
+#         q = max(q, 0.1)
+    
+#     q = q * FLAGS.ptr_alpha
+#     q = max(q, 0.1)
+    
+#     PTR_CHUNK_LOGS.append({
+#         "stage": CURRENT_STAGE,
+#         "mode": "chunk",
+#         "traj_return": traj_return,
+#         "avg_r": avg_r,
+#         "uqm": uqm,
+#         "min_r": min_r,
+#         "max_r": max_r,
+#         "quality": q,
+#     })
+    
+#     return q
 
 
 def compute_episode_quality(ep_id, episode_to_indices, storage):
@@ -696,13 +696,13 @@ def main(_):
         # TensorDict 생성
         td = TensorDict(
             {
-                "observations": torch.from_numpy(obs0).float(),
-                "actions": torch.from_numpy(np.asarray(actions_seq)).float(),
-                "rewards": torch.from_numpy(np.asarray(rewards_seq)).unsqueeze(-1).float(),
-                "rewards_ptr": torch.from_numpy(np.asarray(rewards_seq_ptr)).unsqueeze(-1).float(),
-                "terminals": torch.from_numpy(np.asarray(terminals_seq)).unsqueeze(-1).float(),
-                "masks": torch.from_numpy(np.asarray(masks_seq)).unsqueeze(-1).float(),
-                "next_observations": torch.from_numpy(np.asarray(next_obs_seq)).float(),
+                "observations": torch.from_numpy(obs0.copy()).float(),
+                "actions": torch.from_numpy(np.asarray(actions_seq).copy()).float(),
+                "rewards": torch.from_numpy(np.asarray(rewards_seq).copy()).unsqueeze(-1).float(),
+                "rewards_ptr": torch.from_numpy(np.asarray(rewards_seq_ptr).copy()).unsqueeze(-1).float(),
+                "terminals": torch.from_numpy(np.asarray(terminals_seq).copy()).unsqueeze(-1).float(),
+                "masks": torch.from_numpy(np.asarray(masks_seq).copy()).unsqueeze(-1).float(),
+                "next_observations": torch.from_numpy(np.asarray(next_obs_seq).copy()).float(),
                 "valid": torch.from_numpy(valid_seq).float(),
                 "episode_id": torch.tensor(current_episode_id, dtype=torch.int32),
                 "chunk_start_step": torch.tensor(start_step_in_ep, dtype=torch.int32),
@@ -857,6 +857,8 @@ def main(_):
     next_episode_id += 1
     online_chunk_index = 0
     online_chunk_start_step = 0
+
+    print(f"\n[Online RL] Starting {FLAGS.offline_steps} steps")
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
         CURRENT_STAGE="online_add"
@@ -959,7 +961,7 @@ def main(_):
 
             td = TensorDict(
                 {
-                    "observations": torch.from_numpy(obs0).float(),
+                    "observations": torch.from_numpy(obs0.copy()).float(),
                     "actions": torch.from_numpy(actions_seq).float(),
                     "rewards": torch.from_numpy(rewards_seq_rl).unsqueeze(-1).float(),
                     "rewards_ptr": torch.from_numpy(rewards_seq_ptr).unsqueeze(-1).float(),
