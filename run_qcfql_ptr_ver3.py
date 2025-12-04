@@ -394,16 +394,13 @@ def convert_td_to_batch(td: TensorDict) -> Dict[str, torch.Tensor]:
     return batch
 
 def update_with_tr_lite(agent, 
-                        replay_buffer, 
+                        ep_id, 
                         sampler, 
                         storage, 
                         gamma, 
                         H, 
                         logger, 
                         log_step):
-    
-    td_batch = replay_buffer.sample(1)
-    ep_id = int(td_batch["episode_id"][0].item())
 
     idx_td_list = get_chunks_by_episode(ep_id, storage, EPISODE_TO_INDICES)
     if len(idx_td_list) == 0:
@@ -414,7 +411,7 @@ def update_with_tr_lite(agent,
         key=lambda pair: int(pair[1]["chunk_index"].item())
     )
 
-    # Backward return
+    # Backward return 계산
     G = 0.0
     returns = []
     for idx, c in reversed(idx_td_list):
@@ -432,9 +429,7 @@ def update_with_tr_lite(agent,
 
     returns.reverse()
 
-    # Critic 업데이트 및 priority 재계산
     if FLAGS.priority_mode == 'episode':
-        # Episode mode: 한 번만 계산하여 모든 chunk에 동일 할당
         ep_quality = compute_episode_quality(ep_id, EPISODE_TO_INDICES, storage)
         all_indices = [idx for idx, _ in idx_td_list]
         all_priorities = [ep_quality] * len(all_indices)
@@ -461,6 +456,7 @@ def update_with_tr_lite(agent,
         indices_tensor = torch.tensor(all_indices, dtype=torch.long)
         pri_tensor = torch.tensor(all_priorities, dtype=torch.float32)
         sampler.update_priority(indices_tensor, pri_tensor)
+
 
 # ======================================================================
 # Main
@@ -927,6 +923,7 @@ def main(_):
             )
             batch_td = storage[indices]  
 
+            # critic update (PTR priority 기반)
             rewards = batch_td["rewards"]
             if rewards.ndim == 3 and rewards.shape[-1] == 1:
                 rewards = rewards.squeeze(-1)
@@ -951,7 +948,7 @@ def main(_):
 
             online_critic_info = agent.update_critic(batch)
 
-            # actor update
+            # actor update (offline uniform)
             batch_np = train_dataset.sample_sequence(
                 config['batch_size'],
                 sequence_length=FLAGS.horizon_length,
@@ -964,17 +961,24 @@ def main(_):
                 logger.log(online_critic_info, "online_agent", step=log_step)
                 logger.log(online_actor_info, "online_agent", step=log_step)
 
-        if i % TR_INTERVAL == 0:
-            update_with_tr_lite(
-                agent=agent,
-                replay_buffer=ptr_replay_buffer,
-                sampler=ptr_sampler,
-                storage=storage,
-                gamma=discount,
-                H=H,
-                logger=logger,
-                log_step=log_step,
-            )
+            # Update priorities for sampled indices
+            if i % TR_INTERVAL == 0:
+                # 1) 현재 배치에서 아무 인덱스나 하나 고름
+                idx0 = int(indices[0].item())
+                ep_id0 = int(storage[idx0]["episode_id"].item())
+                
+                # 2) 해당 episode에 대해 TR 업데이트 실행
+                update_with_tr_lite(
+                    agent=agent,
+                    ep_id=ep_id0,
+                    sampler=ptr_sampler,
+                    storage=storage,
+                    gamma=discount,
+                    H=H,
+                    logger=logger,
+                    log_step=log_step,
+                )
+
 
         # eval
         if (
